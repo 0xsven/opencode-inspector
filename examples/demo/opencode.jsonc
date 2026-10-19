@@ -1,0 +1,18 @@
+{
+  // Fictional, self-contained setup. No credentials required.
+  "model": "example/atlas-code",
+  "agent": {
+    "build": { "description": "Turn an idea into a considered, working implementation. Work directly and delegate deliberately.", "variant": "balanced" },
+    "plan": { "description": "Explore the problem, surface tradeoffs, and map a path forward.", "mode": "primary", "permission": { "task": { "*": "deny", "explore": "allow" } } },
+    "general": { "description": "A versatile partner for substantial implementation work.", "mode": "subagent", "variant": "balanced", "permission": "deny" },
+    "explore": { "description": "Find the relevant source and bring back clear, grounded findings.", "mode": "subagent", "permission": { "task": "deny" } }
+  },
+  "provider": { "example": { "options": { "reasoningEffort": "medium" }, "models": {
+    "atlas-code": { "name": "Atlas Code", "limit": { "context": 256000, "input": 200000, "output": 64000 }, "variants": { "balanced": { "reasoningEffort": "medium" }, "deep": { "reasoningEffort": "high" } } },
+    "atlas-fast": { "name": "Atlas Fast", "limit": { "context": 128000, "input": 96000, "output": 32000 } }
+  } } },
+  "mcp": { "local-tools": { "type": "local", "command": ["example-tools", "--stdio"], "enabled": false }, "design-reference": { "type": "remote", "url": "http://127.0.0.1:3845/mcp" } },
+  "plugin": ["example-extension"],
+  "plugins": ["./plugins/context.ts"],
+  "instructions": ["guidance.md"]
+}
