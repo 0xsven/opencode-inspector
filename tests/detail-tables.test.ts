@@ -38,15 +38,16 @@ test('model table preserves settings, configured limits, published capacity and 
 
 test('subagent resolution includes deny, ask, unknown and last matching pattern without an accessible-name list', () => {
   const entry = agent('build', { effectivePermission: { task: { 'quick*': 'allow', quick: 'deny', visual: 'ask', broken: { invalid: true }, 'absent-*': 'allow' } } });
-  const candidates = ['quick', 'quick-extra', 'visual', 'unknown', 'broken'].map(id => agent(id));
-  const excluded = [agent('primary', { mode: 'primary' }), agent('disabled', { disable: true })];
+  const candidates = [...['quick', 'quick-extra', 'visual', 'unknown', 'broken'].map(id => agent(id, { mode: 'subagent' })), agent('general')];
+  const excluded = [agent('primary', { mode: 'primary' }), agent('implicit-primary'), agent('disabled', { mode: 'subagent', disable: true }), agent('hidden', { mode: 'all', hidden: true })];
   const html = render(entry, [entry, ...candidates, ...excluded]);
   const table = html.match(/<table[^>]*aria-label="Subagent rule resolution"[\s\S]*?<\/table>/)![0];
   for (const [id, decision, rule] of [['quick', 'deny', 'quick'], ['quick-extra', 'allow', 'quick*'], ['visual', 'ask — Requires approval', 'visual'], ['unknown', 'unknown', 'No matching configured rule'], ['broken', 'unknown', 'broken']]) {
     assert.ok(table.includes(`href="/agents/${id}"`), id);
     assert.ok(table.includes(`<td role="cell" data-label="Decision">${decision}</td><td role="cell" data-label="Matching rule"><code>${rule}</code>`), id);
   }
-  assert.doesNotMatch(table, /href="\/agents\/(?:build|primary|disabled)"/);
+  assert.doesNotMatch(table, /href="\/agents\/(?:build|primary|implicit-primary|disabled|hidden)"/);
+  assert.match(table, /href="\/agents\/general"/);
   assert.doesNotMatch(html, /subagent-list|rule-list/);
   assert.match(html, /data-section="task-rules"><summary>Configured task rules/);
   const rules = html.match(/<table[^>]*aria-label="Configured task rules in matching order"[\s\S]*?<\/table>/)![0];

@@ -20,13 +20,13 @@ test('production deep links serve the shell, API and missing assets keep their c
     }); req.on('error', reject); req.end();
   });
   try {
-    for (const url of ['/', '/settings', '/agents', '/agents/build?open=prompt', '/models/openai%2Fgpt-6.1-sol', '/plugins/.%2Fplugins%2Ffoo.ts', '/skills/a%20b%25%3F%23', '/commands/x', '/mcp-servers/x', '/instructions/x']) {
+    for (const url of ['/', '/settings', '/settings/general', '/settings/theme', '/usage', '/usage/overview', '/usage/agents', '/usage/models', '/usage/skills', '/agents', '/agents/build?open=prompt&raw=1', '/models/openai%2Fgpt-6.1-sol', '/plugins/.%2Fplugins%2Ffoo.ts', '/skills/a%20b%25%3F%23', '/commands/x', '/mcp-servers/x', '/instructions/x']) {
       const response = await get(url);
       assert.equal(response.status, 200, url); assert.match(response.body, /Inspector shell/);
     }
     const unknown = await get('/unknown', { accept: 'text/html' });
     assert.equal(unknown.status, 404); assert.match(unknown.body, /Inspector shell/);
-    for (const url of ['/agents/%', '/agents/%E0%A4%A', '/agents/', '/settings/extra', '/settings/', '/settings/%']) {
+    for (const url of ['/agents/%', '/agents/%E0%A4%A', '/agents/', '/settings/extra', '/settings/', '/settings/%', '/settings/theme/extra', '/usage/extra', '/usage/', '/usage/%', '/usage/agents/extra']) {
       const response = await get(url); assert.equal(response.status, 404); assert.match(response.body, /Inspector shell/);
     }
     const pathLikeId = await get('/instructions/%2Fetc%2Fpasswd');

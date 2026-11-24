@@ -20,12 +20,19 @@ const contexts: Readonly<Record<string, number>> = Object.freeze({
   'openai/gpt-5.2': 400000,
   'openai/gpt-5.1': 400000,
 });
+const openAIPackages = new Set([
+  'aisdk:@ai-sdk/openai', '@opencode/ai/providers/openai', '@opencode/ai/providers/openai/chat', '@opencode/ai/providers/openai/responses',
+]);
 
 export function lookupModelCapacity(provider: string, key: string, model: Value, providerConfig: Value): ModelCapacity | undefined {
   // A custom endpoint/SDK is not a verified mapping to this catalogue provider.
-  if (provider !== 'openai' || providerConfig.options?.baseURL !== undefined
-    || (providerConfig.npm !== undefined && providerConfig.npm !== '@ai-sdk/openai')) return;
-  const id = model.id === undefined ? key : model.id;
+  const customRoute = (data: Value) => data.api !== undefined || data.options?.baseURL !== undefined || data.settings?.baseURL !== undefined
+    || (data.npm !== undefined && data.npm !== '@ai-sdk/openai')
+    || (data.package !== undefined && !openAIPackages.has(data.package));
+  if (provider !== 'openai' || customRoute(providerConfig) || customRoute(model)
+    || (providerConfig.canonical !== undefined && providerConfig.canonical !== 'openai')
+    || (Array.isArray(model.variants) && model.variants.some(variant => variant && customRoute(variant)))) return;
+  const id = model.modelID !== undefined ? model.modelID : model.id !== undefined ? model.id : key;
   if (typeof id !== 'string' || !id) return;
   const match = `${provider}/${id}`;
   if (!Object.hasOwn(contexts, match)) return;

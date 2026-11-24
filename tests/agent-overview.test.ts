@@ -17,7 +17,7 @@ const model: Entry = { ...agent(), category: 'Models', id: 'openai/gpt-6.1-sol',
 function render(entry: Entry, entries: Entry[] = [entry, model]) {
   return renderToStaticMarkup(createElement(EntryDetail, { entry, entries, choose() {} }));
 }
-const overview = (entry: Entry, entries?: Entry[]) => render(entry, entries).match(/<section class="agent-overview"[\s\S]*?<\/section>/)?.[0] || '';
+const overview = (entry: Entry, entries?: Entry[]) => render(entry, entries).match(/<section class="[^"]*\bagent-overview\b[^"]*"[\s\S]*?<\/section>/)?.[0] || '';
 
 test('agent overview presents all six requested values, configured cap and accessible subagent links', () => {
   const build = { ...agent({ model: model.id, reasoningEffort: 'medium', effectivePermission: { task: { '*': 'deny', quick: 'allow', visual: 'ask' } } }), prompt: 'Local prompt', promptSize: { count: 1234, approximate: true as const, encoding: 'o200k_base' as const } };

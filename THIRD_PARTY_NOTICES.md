@@ -9,6 +9,27 @@ Files: `opencode.json`, `tokyonight.json`, `catppuccin.json`, `catppuccin-macchi
 Only the browser-used color fields are included; references are resolved without changing the source colors.
 The browser applies its own semantic surface mapping and contrast adjustment. These are classic TUI palettes, not a reproduction of newer v2 or desktop theme rendering.
 
+## Tokyo Night dark browser appearance
+
+`src/theme.ts` additionally uses a small GUI-derived appearance snapshot **only for
+built-in Tokyo Night in dark mode**. Custom palettes, including custom Tokyo Night
+overrides, and light mode retain their explicit TUI surface mapping. The bundled
+source palette data above is unchanged.
+
+Source: OpenCode **v1.19.5**, commit `810c0eba1a7348036f8bdf61e6632d0c36c6876c`:
+
+- [`packages/ui/src/theme/themes/tokyonight.json`](https://github.com/anomalyco/opencode/blob/810c0eba1a7348036f8bdf61e6632d0c36c6876c/packages/ui/src/theme/themes/tokyonight.json): ink `#c0caf5`, primary `#7aa2f7`.
+- `packages/ui/src/theme/color.ts`, `v2/resolve.ts`, and `v2/mapping.ts`: calculated V2 dark base `#13141e`, deep `#10111a`, layer-01 `#1b1d28`, muted ink `#a3abd2`.
+- V2 hover overlay: white at 6%, composited onto Inspector's base surface.
+
+Inspector maps base to the content canvas, deep to toolbar/sidebar/drawer, and
+layer-01 to panels/controls/code backgrounds. It retains classic markdown accent
+colors, Inspector selection/divider mapping, and contrast safeguards. This is a
+bounded adaptation, not a port of the GUI engine or an exact Desktop rendering.
+There are no runtime upstream requests. These upstream data/derived values are
+covered by the OpenCode MIT license below; the pinned GUI release has the same
+copyright and license text ([source](https://github.com/anomalyco/opencode/blob/810c0eba1a7348036f8bdf61e6632d0c36c6876c/LICENSE)).
+
 Upstream OpenCode's theme documentation credits [Tokyonight](https://github.com/folke/tokyonight.nvim), [Catppuccin](https://github.com/catppuccin), [Nord](https://github.com/nordtheme/nord), and [Gruvbox](https://github.com/morhetz/gruvbox).
 
 ## OpenCode license

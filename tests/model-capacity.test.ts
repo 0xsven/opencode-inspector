@@ -39,6 +39,17 @@ test('catalogue lookup uses exact provider and API model ID, never family or con
   assert.equal(lookupModelCapacity('example', 'atlas-code', {}, {}), undefined);
   assert.equal(lookupModelCapacity('openai', 'gpt-6-sol', {}, { options: { baseURL: 'https://custom.test' } }), undefined);
   assert.equal(lookupModelCapacity('openai', 'gpt-6-sol', {}, { npm: 'custom-adapter' }), undefined);
+  assert.equal(lookupModelCapacity('openai', 'friendly', { modelID: 'gpt-5.2', id: 'gpt-6-sol' }, { package: '@opencode/ai/providers/openai' })?.context, 400000);
+  for (const [model, provider] of [
+    [{ modelID: null }, {}],
+    [{}, { api: 'https://custom.test' }],
+    [{}, { settings: { baseURL: '{env:BASE_URL}' } }],
+    [{}, { canonical: 'other' }],
+    [{}, { package: '@opencode/ai/providers/openai-compatible' }],
+    [{ package: 'custom-adapter' }, {}],
+    [{ settings: { baseURL: 'https://custom.test' } }, {}],
+    [{ variants: [{ settings: { baseURL: 'https://custom.test' } }] }, {}],
+  ]) assert.equal(lookupModelCapacity('openai', 'gpt-6-sol', model, provider), undefined);
 });
 
 test('parser separates allowlisted capacity from raw fields; Build and Models SSR show the comparison', async () => {

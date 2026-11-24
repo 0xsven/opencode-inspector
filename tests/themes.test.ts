@@ -27,7 +27,33 @@ test('cycles, missing refs, unsupported formats and CSS injection never produce 
     { theme: { text: '#12zzzz' } }, { theme: { text: 256 } }, { theme: { text: -1 } },
     { theme: { text: 2.5 } }, { theme: { text: { dark: '#000000' } } },
     { theme: { unknown: '#fff' } }, { variants: {} },
+    { base: { text: { base: '$text.muted', muted: '$text.base' } }, dark: { hue: {} } },
+    { base: { text: { base: 'url(https://not-a-color.test)' } }, dark: { hue: {} } },
   ]) assert.throws(() => parseTheme(document));
+});
+
+test('native theme uses semantic paths, aliases, overrides and a single-mode fallback', () => {
+  const base = {
+    text: { base: '$hue.neutral.200', muted: '$text.base' },
+    background: { base: 'transparent', raised: { base: '#111', high: '#333' } },
+    markdown: { heading: '$hue.accent.200' },
+  };
+  const dark = {
+    hue: { gray: { 200: '#ddd' }, neutral: '$hue.gray', accent: '$hue.purple', purple: { 200: '#b3f' } },
+    background: { raised: { base: '#222' } },
+  };
+  const light = { hue: { neutral: '$hue.gray', gray: { 200: '#222' }, accent: '$hue.gray' } };
+  const dual = parseTheme({ base, dark, light });
+  assert.equal(dual.dark.text, '#dddddd');
+  assert.equal(dual.dark.textMuted, '#dddddd');
+  assert.equal(dual.dark.background, fallbackColors('dark').background);
+  assert.equal(dual.dark.backgroundPanel, '#222222');
+  assert.equal(dual.dark.backgroundElement, '#333333');
+  assert.equal(dual.dark.markdownHeading, '#bb33ff');
+  assert.equal(dual.light.text, '#222222');
+  assert.equal(dual.light.backgroundPanel, '#111111');
+  const single = parseTheme({ base, dark });
+  assert.deepEqual(single.dark, single.light);
 });
 
 test('discovery precedence, saved selection gating, custom override and sanitized failures', async () => {
@@ -38,13 +64,27 @@ test('discovery precedence, saved selection gating, custom override and sanitize
     const options = { globalRoot: global, stateRoot: state };
     await writeFile(path.join(state, 'kv.json'), JSON.stringify({ theme: 'gruvbox', unrelatedSecret: 'never-respond' }));
     assert.equal((await discoverThemes(global, undefined, options)).selection.name, 'gruvbox');
-    await writeFile(path.join(global, 'cli.json'), JSON.stringify({ theme: { name: 'catppuccin-macchiato' }, privateValue: 'never-respond' }));
+    await writeFile(path.join(global, 'cli.json'), JSON.stringify({ theme: { name: 'catppuccin-macchiato', mode: 'dark' }, privateValue: 'never-respond' }));
     const saved = await discoverThemes(global, undefined, options);
     assert.equal(saved.selection.source, 'saved'); assert.equal(saved.selection.name, 'catppuccin-macchiato');
+    assert.equal(saved.selection.mode, 'dark');
     assert.ok(!JSON.stringify(saved).includes('never-respond'));
+    const old = process.env.OPENCODE_CLI_CONFIG_CONTENT;
+    try {
+      process.env.OPENCODE_CLI_CONFIG_CONTENT = '{"theme":{"mode":"light"},"privateValue":"never-respond"}';
+      const inline = await discoverThemes(global, undefined, options);
+      assert.equal(inline.selection.name, 'catppuccin-macchiato');
+      assert.equal(inline.selection.mode, 'light');
+      assert.ok(!JSON.stringify(inline).includes('never-respond'));
+    } finally {
+      if (old === undefined) delete process.env.OPENCODE_CLI_CONFIG_CONTENT;
+      else process.env.OPENCODE_CLI_CONFIG_CONTENT = old;
+    }
     assert.equal((await discoverThemes(demo, undefined, options)).selection.source, 'fallback');
-    assert.equal((await discoverThemes(global, 'nord', options)).selection.name, 'nord');
+    assert.equal((await discoverThemes(global, 'nord', options)).selection.name, 'catppuccin-macchiato');
     await writeFile(path.join(global, 'tui.json'), '{"theme":"tokyonight"}');
+    assert.equal((await discoverThemes(global, 'nord', options)).selection.name, 'catppuccin-macchiato');
+    await rm(path.join(global, 'cli.json'));
     assert.equal((await discoverThemes(global, 'nord', options)).selection.name, 'tokyonight');
     await writeFile(path.join(global, 'tui.jsonc'), '{ // theme\n"theme":{"name":"custom-one"},}');
     await mkdir(path.join(global, 'themes'));
@@ -62,12 +102,13 @@ test('discovery precedence, saved selection gating, custom override and sanitize
   } finally { await rm(root, { recursive: true, force: true }); }
 });
 
-test('CLI v2 file without a selected theme does not revive stale legacy KV', async () => {
+test('CLI v2 file without a selected theme does not revive stale TUI or KV', async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), 'inspector-theme-cli-'));
   try {
     await writeFile(path.join(root, 'cli.json'), '{}');
     await writeFile(path.join(root, 'kv.json'), '{"theme":"nord"}');
-    const info = await discoverThemes(root, undefined, { globalRoot: root, stateRoot: root });
+    await writeFile(path.join(root, 'tui.json'), '{"theme":"nord"}');
+    const info = await discoverThemes(root, 'nord', { globalRoot: root, stateRoot: root });
     assert.equal(info.selection.source, 'fallback');
   } finally { await rm(root, { recursive: true, force: true }); }
 });
@@ -80,23 +121,62 @@ test('bundled palettes retain pinned source values and readable browser mappings
   for (const palette of bundledThemes) for (const mode of ['dark', 'light'] as const) {
     assert.deepEqual(Object.keys(palette.colors[mode]), [...themeColorKeys]);
     assert.ok(Object.values(palette.colors[mode]).every(value => /^#[\da-f]{6}$/i.test(value)));
+  }
+  for (const palette of [undefined, ...bundledThemes]) for (const mode of ['dark', 'light'] as const) {
     const css = appearance(palette, mode);
     assert.ok(contrast(css.secondary, css.background) >= 4.5);
     assert.ok(contrast(css['panel-text'], css.panel) >= 4.5);
     assert.ok(contrast(css['selected-text'], css.selected) >= 4.5);
+    assert.ok(contrast(css['selected-secondary'], css.selected) >= 4.5);
+    assert.ok(contrast(css['panel-secondary'], css.panel) >= 4.5);
+    assert.ok(contrast(css['hover-text'], css.hover) >= 4.5);
+    assert.ok(contrast(css['control-text'], css['control-bg']) >= 4.5);
+    assert.ok(contrast(css['control-line'], css['control-bg']) >= 3);
+    assert.ok(contrast(css['focus-line'], css.background) >= 3);
+    assert.ok(contrast(css['code-text'], css['code-bg']) >= 4.5);
+    assert.ok(contrast(css['inline-text'], css['inline-bg']) >= 4.5);
+    const idleOpacity = Number(css['refresh-idle-opacity']);
+    assert.ok(idleOpacity >= .65 && idleOpacity <= 1);
+    assert.ok(contrast(`#${[0, 2, 4].map((offset) => {
+      const fg = css.text.slice(1 + offset, 3 + offset);
+      const bg = css.background.slice(1 + offset, 3 + offset);
+      return Math.round(parseInt(fg, 16) * idleOpacity + parseInt(bg, 16) * (1 - idleOpacity)).toString(16).padStart(2, '0');
+    }).join('')}`, css.background) >= 4.5);
   }
   assert.equal(appearance(undefined, 'dark').background, '#191c1f');
 });
 
-test('Tokyo Night uses subtle resting borders and active borders only for focus', () => {
+test('Tokyo Night separates quiet surface dividers from readable controls and focus', () => {
   const palette = bundledThemes.find(item => item.name === 'tokyonight')!;
+  const original = JSON.stringify(palette);
   for (const mode of ['dark', 'light'] as const) {
     const css = appearance(palette, mode);
-    for (const key of ['line', 'panel-line', 'control-line', 'quote-border']) {
-      assert.equal(css[key], palette.colors[mode].borderSubtle, key);
-    }
-    assert.equal(css['focus-line'], palette.colors[mode].borderActive);
+    const idleOpacity = Number(css['refresh-idle-opacity']);
+    assert.ok(idleOpacity >= .65);
+    assert.ok(contrast(`#${[0, 2, 4].map((offset) => {
+      const fg = css.text.slice(1 + offset, 3 + offset);
+      const bg = css.background.slice(1 + offset, 3 + offset);
+      return Math.round(parseInt(fg, 16) * idleOpacity + parseInt(bg, 16) * (1 - idleOpacity)).toString(16).padStart(2, '0');
+    }).join('')}`, css.background) >= 4.5);
+    assert.ok(contrast(css.line, css.background) < contrast(css['focus-line'], css.background));
+    assert.ok(contrast(css['panel-line'], css.panel) < contrast(css['control-line'], css['control-bg']));
+    assert.equal(css['quote-border'], palette.colors[mode].borderSubtle);
+    assert.ok(contrast(css['focus-line'], css.background) >= 3);
     assert.equal(css['markdown-rule'], palette.colors[mode].markdownHorizontalRule);
+  }
+  assert.equal(JSON.stringify(palette), original);
+  const gui = appearance(palette, 'dark');
+  assert.equal(gui.background, '#13141e');
+  assert.equal(gui.chrome, '#10111a');
+  // Custom overrides (including the same name) keep their explicit surfaces.
+  const custom = { ...palette, kind: 'custom' as const, id: 'custom:tokyonight' };
+  const css = appearance(custom, 'dark');
+  assert.equal(css.background, palette.colors.dark.background);
+  assert.equal(css.chrome, palette.colors.dark.background);
+  assert.equal(css.panel, palette.colors.dark.backgroundPanel);
+  assert.equal(appearance(palette, 'light').background, palette.colors.light.background);
+  for (const surface of [gui.background, gui.chrome, gui.panel, gui.selected, gui.hover]) {
+    assert.ok(contrast(gui['focus-line'], surface) >= 3);
   }
 });
 
@@ -109,6 +189,10 @@ test('preferences are Inspector-only, validated, storage-safe and follow refresh
   assert.equal(savePreferences({ setItem: (key) => assert.equal(key, preferenceKey) }, defaultPreferences), true);
   const info = { selection: { name: 'nord', source: 'configured' as const, detail: 'Configured · tui.json' }, palettes: bundledThemes, warnings: [] };
   assert.equal(appliedTheme(info, defaultPreferences, true).palette?.name, 'nord');
+  const darkCli = { ...info, selection: { ...info.selection, mode: 'dark' as const } };
+  assert.equal(appliedTheme(darkCli, defaultPreferences, false).mode, 'dark');
+  assert.equal(appliedTheme(darkCli, { ...defaultPreferences, mode: 'light' }, true).mode, 'light');
+  assert.equal(appliedTheme(darkCli, { theme: 'builtin:tokyonight', mode: 'auto' }, false).mode, 'light');
   assert.equal(appliedTheme({ ...info, selection: { ...info.selection, name: 'gruvbox' } }, defaultPreferences, false).palette?.name, 'gruvbox');
   assert.equal(appliedTheme(info, { theme: 'builtin:tokyonight', mode: 'light' }, true).mode, 'light');
   assert.equal(appliedTheme(info, { theme: 'builtin:tokyonight', mode: 'auto' }, false).mode, 'light');

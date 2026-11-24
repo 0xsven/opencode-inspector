@@ -9,12 +9,12 @@
     "url": "https://github.com/0xsven/opencode-inspector.git"
   },
   "engines": {
-    "node": ">=22"
+    "node": ">=22.13"
   },
   "type": "module",
   "scripts": {
     "dev": "node scripts/launch.mjs dev",
-    "build": "tsc --noEmit && vite build && esbuild server/index.ts --bundle --platform=node --format=esm --packages=external --outfile=dist/server/index.js",
+    "build": "tsc --noEmit && vite build && esbuild server/index.ts server/usage-worker.ts --bundle --platform=node --format=esm --packages=external --outdir=dist/server",
     "start": "node scripts/launch.mjs start",
     "test": "tsx --test tests/*.test.ts",
     "typecheck": "tsc --noEmit"

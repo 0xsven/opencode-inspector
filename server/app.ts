@@ -1,11 +1,29 @@
 import express from 'express';
 import path from 'node:path';
-import os from 'node:os';
+import { globalConfigRoot } from './config-root.js';
 import { inspect } from './parser.js';
 import { categorySlugs, parseLocation } from '../src/navigation.js';
+import { parseUsageRange, resolveUsageDatabase } from './usage.js';
+import { UsageIndex } from './usage-index.js';
+import type { Server } from 'node:http';
 
-export function createApp({ root = process.env.OPENCODE_CONFIG_ROOT || path.join(os.homedir(), '.config/opencode'), production = process.env.NODE_ENV === 'production', clientDirectory = path.resolve('dist/client') } = {}) {
+export function createApp({ root = process.env.OPENCODE_CONFIG_ROOT || globalConfigRoot(), production = process.env.NODE_ENV === 'production', clientDirectory = path.resolve('dist/client'), usageDatabase = undefined as string | undefined, usageCacheDirectory = undefined as string | undefined } = {}) {
+  const database = usageDatabase === undefined ? resolveUsageDatabase(root) : Promise.resolve(usageDatabase);
+  const usage = new UsageIndex(usageCacheDirectory);
   const app = express();
+  app.locals.closeUsage = () => usage.close();
+  const listen = app.listen.bind(app);
+  app.listen = ((...args: any[]) => {
+    const server = Reflect.apply(listen, undefined, args) as Server;
+    server.once('close', () => { void usage.close(); });
+    const close = server.close.bind(server);
+    server.close = ((callback?: (error?: Error) => void) => {
+      const disposed = usage.close();
+      close(error => { void disposed.then(() => callback?.(error)); });
+      return server;
+    }) as typeof server.close;
+    return server;
+  }) as typeof app.listen;
   app.disable('x-powered-by');
   app.use((req, res, next) => {
     res.set({ 'X-Content-Type-Options': 'nosniff', 'Referrer-Policy': 'no-referrer', 'Cache-Control': 'no-store' });
@@ -21,6 +39,12 @@ export function createApp({ root = process.env.OPENCODE_CONFIG_ROOT || path.join
   app.get('/api/snapshot', async (_req, res) => {
     try { res.json(await inspect(root)); } catch { res.status(500).json({ error: 'Could not read the configured directory. Check the path and local file permissions.' }); }
   });
+  app.get('/api/usage', async (req, res) => {
+    const { refresh, ...query } = req.query;
+    const range = parseUsageRange(query);
+    if (!range || (refresh !== undefined && refresh !== '1')) return void res.status(400).json({ error: 'Expected from/to epoch milliseconds, an exclusive end within 32 days (26 hours for hourly granularity), an IANA timezone, and optional granularity=hour|day and refresh=1.' });
+    res.json(await usage.read(await database, range, refresh === '1'));
+  });
   app.use('/api', (_req, res) => { res.status(404).json({ error: 'Not found' }); });
   if (production) {
     app.use((_req, res, next) => { res.setHeader('Content-Security-Policy', "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'none'; connect-src 'self'; base-uri 'none'; frame-ancestors 'none'"); next(); });
@@ -30,7 +54,8 @@ export function createApp({ root = process.env.OPENCODE_CONFIG_ROOT || path.join
     app.use((req, res, next) => {
       if (req.method !== 'GET' && req.method !== 'HEAD') return next();
       const view = parseLocation(req.path);
-      const knownPage = req.path.split('/')[1] === 'settings' || Object.values(categorySlugs).includes(req.path.split('/')[1]);
+      // The shared codec includes Usage/Settings subpages and their legacy aliases.
+      const knownPage = ['settings', 'usage'].includes(req.path.split('/')[1]) || Object.values(categorySlugs).includes(req.path.split('/')[1]);
       if (!view.invalid || knownPage) return res.status(view.invalid ? 404 : 200).sendFile(path.join(clientDirectory, 'index.html'));
       // Browser navigations get an honest not-found view; missing files stay 404.
       if (req.accepts('html') && !path.extname(req.path)) return res.status(404).sendFile(path.join(clientDirectory, 'index.html'));
