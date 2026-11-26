@@ -7,6 +7,7 @@ import { SettingsPage } from './SettingsPage';
 import type { Category, Entry, Snapshot } from './types';
 import { UsagePage } from './UsagePage';
 import { useInspectorTheme } from './useTheme';
+import { useClockFormat } from './useClockFormat';
 import { RouteLink } from './WorkspaceLinks';
 
 const usageLabels = { overview: 'Overview', agents: 'Agents', models: 'Models', skills: 'Skills' } as const;
@@ -21,6 +22,7 @@ export function App(props: { initialSnapshot?: Snapshot; initialRoute?: string }
   const router = typeof window === 'undefined' ? undefined : createBrowserNavigation(window);
   const initial = props.initialRoute ? new URL(props.initialRoute, 'http://localhost') : undefined;
   const [view, setView] = createSignal(initial ? parseLocation(initial.pathname, initial.search) : router?.read() ?? parseLocation('/'));
+  const clockState = useClockFormat();
   const route = () => view().route;
   const category = () => route().category;
   const id = () => route().id;
@@ -197,7 +199,7 @@ export function App(props: { initialSnapshot?: Snapshot; initialRoute?: string }
 
     <Show when={lastUsage() !== null}>
       <main class="usage-workspace" hidden={!isUsage()} aria-label="Usage">
-        <div class="usage-workspace-content" ref={usageContent}><UsagePage subpage={returnRoute().subpage} active={isUsage()} go={go}/></div>
+        <div class="usage-workspace-content" ref={usageContent}><UsagePage subpage={returnRoute().subpage} active={isUsage()} go={go} clockFormat={clockState.format}/></div>
       </main>
     </Show>
 
@@ -205,7 +207,7 @@ export function App(props: { initialSnapshot?: Snapshot; initialRoute?: string }
       <div class="return-to-usage">{backToUsage()}</div>
       <div class="workspace">
         <main class="detail-pane" ref={settingsMain} aria-label="Settings">
-          <SettingsPage subpage={route().subpage} themeState={themeState} snapshot={snapshot()} loading={loading()} error={error()} retry={() => void load()} go={go}/>
+          <SettingsPage subpage={route().subpage} themeState={themeState} clockState={clockState} snapshot={snapshot()} loading={loading()} error={error()} retry={() => void load()} go={go}/>
         </main>
       </div>
     </Show>

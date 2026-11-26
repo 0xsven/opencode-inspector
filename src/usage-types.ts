@@ -61,6 +61,13 @@ export interface UsageCounts {
   tokens: UsageTokens;
 }
 
+export interface UsageHourOfDay {
+  /** Local clock hour (0–23), combining repeated hours. */
+  hour: number;
+  steps: number;
+  tokens: UsageTokens;
+}
+
 export type UsageDelegationStatus = 'pending' | 'streaming' | 'running' | 'completed' | 'error' | 'unknown';
 export interface UsageDelegationNode {
   id: string;
@@ -107,6 +114,8 @@ export type UsageResponse = {
   /** Up to ten sessions, ranked by known in-period tokens in the selected scope. */
   topSessionsByTokens: UsageTopSession[];
   activity: Array<UsageCounts & { date: string }>;
+  /** Exactly 24 buckets in hour order, including zeroes. Older servers may omit this. */
+  activityByHour?: UsageHourOfDay[];
   /** Historical assistant attribution; missing names and durable auxiliary usage
    * (compaction/title/generate, with no assistant step) are grouped as "Unknown".
    */

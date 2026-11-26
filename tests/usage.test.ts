@@ -30,6 +30,17 @@ function readUsage(filename: string | undefined, selectedRange: Parameters<typeo
   } finally { source.close(); index.close(); }
   return live;
 }
+function assertHours(result: ReturnType<typeof readUsage>, expected: [hour: number, steps: number, total: number][]) {
+  assert.ok(result.status !== 'unavailable');
+  const hours = result.activityByHour;
+  assert.ok(hours);
+  assert.deepEqual(hours.map(row => row.hour), Array.from({ length: 24 }, (_, hour) => hour));
+  assert.deepEqual(hours.filter(row => row.steps || row.tokens.total).map(row => [row.hour, row.steps, row.tokens.total]), expected);
+  assert.equal(hours.reduce((sum, row) => sum + row.steps, 0), result.summary.steps);
+  for (const key of Object.keys(result.summary.tokens) as Array<keyof typeof result.summary.tokens>) {
+    assert.equal(hours.reduce((sum, row) => sum + row.tokens[key], 0), result.summary.tokens[key], key);
+  }
+}
 async function fixture(run: (db: DatabaseSync, filename: string) => Promise<void> | void) {
   const directory = await mkdtemp(path.join(os.tmpdir(), 'inspector-usage-'));
   const filename = path.join(directory, 'usage.db');
@@ -177,6 +188,7 @@ test('weekly and monthly buckets use local calendar boundaries and count distinc
       });
       assert.equal(result.agents[0].sessions, 3);
       assert.equal(result.models[0].sessions, 3);
+      assertHours(result, [[0, 7, 294], [1, 2, 84], [23, 3, 126]]);
     }
   });
 });
@@ -200,6 +212,24 @@ test('hourly model and agent timelines keep the repeated local hour distinct', a
     assert.deepEqual(result.agentActivity, [{ ...expected[0], agent: 'build', role: 'main' }, { ...expected[1], agent: 'review', role: 'main' }]);
     assert.equal(result.activity.length, 1, 'overview remains daily');
     assert.equal(result.summary.tokens.total, 84);
+    assertHours(result, [[1, 2, 84]]);
+  });
+});
+
+test('hour-of-day buckets respect spring-forward, non-whole offsets and half-open boundaries', async () => {
+  await fixture((db, filename) => {
+    const transition = Date.parse('2026-03-08T07:00:00Z');
+    const quarterHour = Date.parse('2026-03-08T07:15:00Z');
+    const selected = { from: transition - 1, to: quarterHour + 1 };
+    session(db, 'root', selected.from - 1000);
+    [selected.from - 1, selected.from, transition, quarterHour, selected.to].forEach((time, i) =>
+      message(db, `msg-${i}`, 'root', time, 'build', 'assistant', 'legacy'));
+
+    // The transition goes straight from 01:59:59.999 to 03:00 local.
+    assertHours(readUsage(filename, { ...selected, timezone: 'America/New_York' }), [[1, 1, 42], [3, 2, 84]]);
+    // UTC+05:45 crosses a local hour at 07:15 UTC, not on the UTC hour.
+    assertHours(readUsage(filename, { ...selected, timezone: 'Asia/Kathmandu' }), [[12, 2, 84], [13, 1, 42]]);
+    assertHours(readUsage(filename, { from: transition + 1, to: quarterHour, timezone: 'Asia/Kathmandu' }), []);
   });
 });
 
@@ -330,7 +360,7 @@ test('project scopes reconcile moved sessions, roll up verified descendants, and
     message(db, 'cycle-step', 'cycle');
     message(db, 'conflict-step', 'ambiguous');
     message(db, 'exclusive-end', 'root-moved', to);
-    db.prepare('INSERT INTO event VALUES(?,?,?,?,?)').run('durable', 'child', 'session.usage.recorded.1', from + 4000, JSON.stringify({ source: 'title', tokens }));
+    db.prepare('INSERT INTO event VALUES(?,?,?,?,?)').run('durable', 'child', 'session.usage.recorded.1', from + 3_604_000, JSON.stringify({ source: 'title', tokens }));
     skillPart(db, 'legacy-skill', 'migrated', 'root-moved', 'completed', 'legacy-skill');
     skillPart(db, 'alpha-skill', 'a1', 'alpha-root', 'error', 'legacy-skill');
     taskPart(db, 'moved-attempt', 'migrated', 'root-moved', { child: 'child' });
@@ -366,6 +396,7 @@ test('project scopes reconcile moved sessions, roll up verified descendants, and
     for (const rows of [scoped.activity, scoped.agents, scoped.models, scoped.agentActivity, scoped.modelActivity]) {
       assert.equal(rows.reduce((sum, row) => sum + row.steps, 0), 4);
     }
+    assertHours(scoped, [[20, 4, 126], [21, 0, 42]]);
     assert.deepEqual(scoped.skills.map(row => row.name), ['activated', 'legacy-skill', 'v2-skill']);
     assert.equal(scoped.delegations.totalAttempts, 1);
     assert.equal(scoped.delegations.unlocatedAttempts, 0);
@@ -400,6 +431,7 @@ test('project scopes reconcile moved sessions, roll up verified descendants, and
     for (const rows of [combined.activity, combined.agents, combined.models, combined.agentActivity, combined.modelActivity]) {
       assert.equal(rows.reduce((sum, row) => sum + row.steps, 0), 9);
     }
+    assertHours(combined, [[20, 9, 336], [21, 0, 42]]);
     assert.deepEqual(combined.models.map(row => [row.sessions, row.steps]), [[7, 9]], 'shared model rows merge across selected owners');
     assert.deepEqual(combined.skills, [
       { name: 'activated', sessions: 1, loads: 1, failedLoads: 0 },

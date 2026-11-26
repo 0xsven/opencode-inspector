@@ -32,10 +32,19 @@
   --activity-height: clamp(156px, 22vw, 216px);
   padding-inline: var(--overview-card-inset);
 }
+.usage-activity-controls {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 8px;
+  margin-bottom: 24px;
+}
+.usage-activity-view { margin-inline-start: auto; }
+.usage-activity-menu { width: 9rem; }
 .usage-activity-legend {
   --legend-button-inset: 6px;
   gap: 2px 4px;
-  margin-bottom: 24px;
+  margin: 0;
   padding-inline-start: calc(var(--overview-content-start) - var(--legend-button-inset));
 }
 .usage-activity-legend button {
@@ -57,7 +66,6 @@
   display: grid;
   grid-auto-flow: column;
   grid-auto-columns: minmax(0, 1fr);
-  margin-block-start: 8px;
   margin-inline-start: var(--overview-content-start);
   font-size: 11px;
 }
@@ -115,17 +123,19 @@
 .usage-activity-column[data-active="true"] .usage-chart-bar:has(.usage-token-segment) { box-shadow: 0 0 0 1px var(--panel-text); }
 .usage-overview-axis { margin: 4px 0 0; margin-inline-start: var(--overview-content-start); color: var(--panel-secondary); font-size: 11px; text-align: center; }
 
-.usage-controls {
+:is(.usage-controls, .usage-activity-controls) {
   --usage-control-height: 28px;
   --usage-option-height: 30px;
   --usage-control-padding: 8px;
   --usage-control-gap: 6px;
+}
+.usage-controls {
   display: flex;
   align-items: center;
   gap: 8px;
   margin-bottom: 12px;
 }
-.usage-controls :is(.usage-toolbar-trigger, .usage-filter-trigger) {
+:is(.usage-controls, .usage-activity-controls) :is(.usage-toolbar-trigger, .usage-filter-trigger) {
   height: var(--usage-control-height);
   min-height: var(--usage-control-height);
   padding-block: 0;
@@ -134,23 +144,23 @@
   color: var(--secondary);
   font-weight: 500;
 }
-.usage-controls :is(.usage-toolbar-trigger, .usage-filter-trigger):hover:where(:not(:disabled)) {
+:is(.usage-controls, .usage-activity-controls) :is(.usage-toolbar-trigger, .usage-filter-trigger):hover:where(:not(:disabled)) {
   background: var(--hover);
   color: var(--hover-text);
 }
-.usage-controls :is(details[open] > .usage-toolbar-trigger, .usage-filter-trigger[aria-expanded="true"]) {
+:is(.usage-controls, .usage-activity-controls) :is(details[open] > .usage-toolbar-trigger, .usage-filter-trigger[aria-expanded="true"]) {
   background: var(--hover);
   color: var(--panel-text);
 }
 .usage-controls > :not(.usage-filters) { flex: none; }
-.usage-controls :is(summary.usage-toolbar-trigger, .usage-filter-trigger) {
+:is(.usage-controls, .usage-activity-controls) :is(summary.usage-toolbar-trigger, .usage-filter-trigger) {
   align-items: center;
   justify-content: space-between;
   gap: var(--usage-control-gap);
   padding-inline: var(--usage-control-padding);
 }
-.usage-controls summary.usage-toolbar-trigger { display: flex; position: relative; }
-.usage-controls summary.usage-toolbar-trigger::-webkit-details-marker { display: none; }
+:is(.usage-controls, .usage-activity-controls) summary.usage-toolbar-trigger { display: flex; position: relative; }
+:is(.usage-controls, .usage-activity-controls) summary.usage-toolbar-trigger::-webkit-details-marker { display: none; }
 .usage-date-short-label { display: none; }
 .usage-status { margin-inline-start: auto; }
 .usage-controls .usage-status summary { justify-content: center; gap: 4px; min-width: var(--usage-control-height); padding-inline: 6px; }
@@ -262,7 +272,7 @@
 }
 @media (max-width: 700px) {
   .usage-page { padding-block: 16px 32px; }
-  .usage-controls { --usage-control-height: 34px; --usage-option-height: 38px; }
+  :is(.usage-controls, .usage-activity-controls) { --usage-control-height: 34px; --usage-option-height: 38px; }
   .usage-lead .usage-count-grid { gap: 0; }
   .usage-lead .usage-count-grid > div { padding: 10px 8px; }
   .usage-lead .usage-count-grid dt { font-size: 12px; }
@@ -271,7 +281,7 @@
   .usage-section h2 { margin-bottom: 10px; }
 }
 @media (pointer: coarse) {
-  .usage-controls { --usage-control-height: 44px; --usage-option-height: 44px; }
+  :is(.usage-controls, .usage-activity-controls) { --usage-control-height: 44px; --usage-option-height: 44px; }
 }
 @media (max-width: 640px) {
   .usage-controls > .usage-filters { flex: 1 1 auto; }

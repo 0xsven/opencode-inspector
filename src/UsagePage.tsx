@@ -1,6 +1,7 @@
 import { batch, createEffect, createMemo, createSignal, For, Match, on, onCleanup, onMount, Show, Switch, type ComponentProps, type JSX } from 'solid-js';
 import type { MainAgentFilter } from './DelegationTrees';
-import type { UsageMeasure } from './UsageCharts';
+import type { ClockFormat } from './useClockFormat';
+import type { ActivityView, UsageMeasure } from './UsageCharts';
 import { UsageDateRangePicker, UsageDisclosure } from './UsageDateRange';
 import { UsageFilters } from './UsageFilters';
 import { UsageAgents, UsageModels, UsageOverview, UsageSkills, type SelectedProject, type TimelineControls } from './UsageViews';
@@ -17,12 +18,13 @@ const isBuilding = (index?: UsageIndexState) => index?.state === 'indexing' || i
 const sourceWarning = 'Couldn’t check for new usage history.';
 const legacyWarning = 'New usage may be available. Restart Inspector to turn on automatic updates.';
 
-export function UsagePage(props: { subpage: UsageSubpage; active: boolean; go: (route: Route) => void }) {
+export function UsagePage(props: { subpage: UsageSubpage; active: boolean; go: (route: Route) => void; clockFormat?: ClockFormat }) {
   const [dateSelection, setDateSelection] = createSignal<UsageDateSelection>('week');
   const [project, setProject] = createSignal<SelectedProject>();
   const [mainAgent, setMainAgent] = createSignal<MainAgentFilter>();
   let filterButton: HTMLButtonElement | undefined;
   const [measure, setMeasure] = createSignal<UsageMeasure>('tokens');
+  const [activityView, setActivityView] = createSignal<ActivityView>('timeline');
   const [timelineView, setTimelineView] = createSignal<TimelineControls['view']>('bars');
   const [timelineRole, setTimelineRole] = createSignal<TimelineControls['role']>('all');
   const timeline: TimelineControls = {
@@ -224,6 +226,7 @@ export function UsagePage(props: { subpage: UsageSubpage; active: boolean; go: (
     <Show when={usage()}>{data => <Switch>
       <Match when={props.subpage === 'overview'}>
         <UsageOverview data={data()} period={chartPeriod()} project={project()} measure={measure()}
+          activityView={activityView()} onActivityViewChange={setActivityView} active={props.active} clockFormat={props.clockFormat}
           onProjectClick={selectRankedProject} go={props.go}/>
       </Match>
       <Match when={props.subpage === 'agents'}>

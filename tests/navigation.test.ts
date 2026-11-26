@@ -153,13 +153,14 @@ test('Settings routes show only their pane, and Indexing is independent of confi
   assert.match(html, /Configuration information/);
   assert.match(html, /Config root/);
   assert.match(html, /<h1[^>]*>Settings · General<\/h1>/);
-  assert.doesNotMatch(html, /appearance-controls/);
+  assert.match(html, /Clock format/);
+  assert.doesNotMatch(html, /<legend>Appearance<\/legend>/);
   assert.match(html, /aria-label="Settings pages"[^>]*><a(?=[^>]*aria-current="page")[^>]*href="\/settings"/);
   const theme = renderComponent(App, { initialSnapshot: snapshot, initialRoute: '/settings/theme' });
   assert.match(theme, /<h1[^>]*>Settings · Theme<\/h1>/);
   assert.match(theme, /Preferences for this browser\. Your OpenCode configuration is unchanged\./);
   for (const text of ['<legend>Appearance</legend>', 'Inspector default', 'appearance-status', 'Follow reads configured', 'Desktop has separate browser storage', 'System is a browser approximation']) assert.ok(theme.includes(text), text);
-  assert.doesNotMatch(theme, /Configuration information|Config root/);
+  assert.doesNotMatch(theme, /Configuration information|Config root|Clock format/);
   assert.doesNotMatch(html, /class="item-column"|name="item"|Choose a category to begin/);
   const pending = renderComponent(App, { initialRoute: '/settings' });
   assert.match(pending, /<h1[^>]*>Settings · General<\/h1>/);

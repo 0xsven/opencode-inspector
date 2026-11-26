@@ -11,6 +11,17 @@ const longMonth = new Intl.DateTimeFormat('en-US', { month: 'long', year: 'numer
 export const usageBucketAxis = { hour: 'Hour', day: 'Date', week: 'Week starting Monday', month: 'Month' };
 export const usageBucketFrequency = { hour: 'Hourly', day: 'Daily', week: 'Weekly', month: 'Monthly' };
 
+export function usageHourOfDayLabels(locale?: string, hourCycle?: 'h12' | 'h23') {
+  const options = { hourCycle, timeZone: 'UTC' } as const;
+  const axis = new Intl.DateTimeFormat(locale, { ...options, hour: 'numeric' });
+  const detail = new Intl.DateTimeFormat(locale, { ...options, hour: 'numeric', minute: '2-digit' });
+  // Hours are already local wall-clock values. UTC is only their display carrier.
+  return Array.from({ length: 24 }, (_, hour) => {
+    const instant = Date.UTC(2000, 0, 1, hour);
+    return { dateTime: `${String(hour).padStart(2, '0')}:00`, label: axis.format(instant), heading: detail.format(instant) };
+  });
+}
+
 function calendarDate(timestamp: number) {
   const local = new Date(timestamp);
   // Encode the browser's civil date in UTC for calendar arithmetic across DST.

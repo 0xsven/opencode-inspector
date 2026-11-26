@@ -1,8 +1,9 @@
 import { createMemo, For, Show, type ComponentProps } from 'solid-js';
 import { DelegationTrees, type MainAgentFilter } from './DelegationTrees';
-import { OverviewChart, RankedCountChart, RankedModelChart, type UsageMeasure } from './UsageCharts';
+import { OverviewChart, RankedCountChart, RankedModelChart, type ActivityView, type UsageMeasure } from './UsageCharts';
 import { UsageTable } from './UsageTable';
 import { UsageTimeline } from './UsageTimeline';
+import type { ClockFormat } from './useClockFormat';
 import { RouteLink } from './WorkspaceLinks';
 import { usageRoute, type Route } from './navigation';
 import type { usageRange } from './usage-period';
@@ -62,6 +63,10 @@ export function UsageOverview(props: {
   period: ChartPeriod;
   project?: SelectedProject;
   measure: UsageMeasure;
+  activityView: ActivityView;
+  onActivityViewChange: (view: ActivityView) => void;
+  active: boolean;
+  clockFormat?: ClockFormat;
   onProjectClick: (project: UsageProject) => void;
   go: (route: Route) => void;
 }) {
@@ -96,7 +101,8 @@ export function UsageOverview(props: {
     </section>
     <section class="usage-section">
       <h2>Activity</h2>
-      <OverviewChart activity={props.data.activity} from={props.period.from} to={props.period.to} granularity={props.period.granularity} metric={props.measure}/>
+      <OverviewChart activity={props.data.activity} activityByHour={props.data.activityByHour} from={props.period.from} to={props.period.to}
+        granularity={props.period.granularity} metric={props.measure} view={props.activityView} onViewChange={props.onActivityViewChange} active={props.active} clockFormat={props.clockFormat}/>
     </section>
     <div class="usage-overview-lists">
       <Show when={!props.project}>

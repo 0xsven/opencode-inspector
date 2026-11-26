@@ -5,6 +5,7 @@ import type { ThemePreferences } from './theme';
 import type { Snapshot } from './types';
 import type { useInspectorTheme } from './useTheme';
 import { WorkspaceLinks } from './WorkspaceLinks';
+import type { ClockFormat, useClockFormat } from './useClockFormat';
 
 const settingsLinks = [
   { label: 'General', route: settingsRoute },
@@ -20,7 +21,7 @@ const defaultThemeOptions = [
 type ThemeState = ReturnType<typeof useInspectorTheme>;
 
 export function SettingsPage(props: {
-  subpage?: Route['subpage']; themeState: ThemeState; snapshot?: Snapshot; loading: boolean; error: string; retry: () => void; go: (route: Route) => void;
+  subpage?: Route['subpage']; themeState: ThemeState; clockState: ReturnType<typeof useClockFormat>; snapshot?: Snapshot; loading: boolean; error: string; retry: () => void; go: (route: Route) => void;
 }) {
   const showTheme = () => props.subpage === 'theme';
   const current = () => settingsLinks.find(link => link.route.subpage === props.subpage) ?? settingsLinks[0];
@@ -31,11 +32,22 @@ export function SettingsPage(props: {
       <p class="secondary">{showTheme() ? 'Preferences for this browser. Your OpenCode configuration is unchanged.' : 'Read-only information about your local OpenCode configuration.'}</p>
       <Show when={props.loading}><p class="secondary" role="status">{showTheme() ? 'Reading configured theme and available palettes…' : 'Reading configuration…'}</p></Show>
       <Show when={props.error}><div class="settings-error surface-card" role="alert"><p>{props.error} Configured theme information may be unavailable or out of date.</p><button class="plain-button" onClick={() => props.retry()}>Try again</button></div></Show>
-      <Show when={showTheme()} fallback={<ConfigurationInformation snapshot={props.snapshot}/>}>
+      <Show when={showTheme()} fallback={<><ClockSettings state={props.clockState}/><ConfigurationInformation snapshot={props.snapshot}/></>}>
         <ThemeSettings themeState={props.themeState} theme={props.snapshot?.theme}/>
       </Show>
     </Show>
   </div>;
+}
+
+function ClockSettings(props: { state: ReturnType<typeof useClockFormat> }) {
+  return <fieldset class="appearance-controls surface-card">
+    <legend>Display</legend>
+    <label>Clock format<select value={props.state.format} onChange={event => props.state.updateFormat(event.currentTarget.value as ClockFormat)}>
+      <option value="automatic">Automatic</option><option value="h12">12-hour</option><option value="h23">24-hour</option>
+    </select></label>
+    <p class="secondary">Applies to Activity → Hour of day. Automatic uses your browser language.</p>
+    <Show when={props.state.storageFailed}><p class="secondary">Browser storage is unavailable. This choice lasts until you reload.</p></Show>
+  </fieldset>;
 }
 
 function ConfigurationInformation(props: { snapshot?: Snapshot }) {

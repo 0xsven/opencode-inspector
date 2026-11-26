@@ -1,12 +1,15 @@
 import { createMemo, createSignal, Index, mergeProps, Show } from 'solid-js';
 import { ChartInspection, ChartLegend, chartNumber as number, chartTargetKey, useChartInspection, usePlotWidth, type ChartDatum, type InspectionState } from './ChartInspection';
-import { usageBucketAxis, usageBucketFrequency, usageChartBuckets } from './usage-chart-dates';
+import { UsageDisclosure } from './UsageDateRange';
+import type { ClockFormat } from './useClockFormat';
+import { usageBucketAxis, usageBucketFrequency, usageChartBuckets, usageHourOfDayLabels } from './usage-chart-dates';
 import { localDateInput } from './usage-period';
-import type { UsageCounts, UsageGranularity, UsageTokens } from './usage-types';
+import type { UsageCounts, UsageGranularity, UsageHourOfDay, UsageTokens } from './usage-types';
 
 export { ChartInspection, useChartInspection, usePlotWidth } from './ChartInspection';
 
 export type UsageMeasure = 'tokens' | 'steps';
+export type ActivityView = 'timeline' | 'hourOfDay';
 
 const parts = [
   { label: 'Input', key: 'input', color: '#80b9c2' },
@@ -22,6 +25,8 @@ const rankingLimit = 8;
 const tokenEntries = (tokens?: UsageTokens, items: readonly { label: string; key: typeof parts[number]['key']; color: string }[] = parts) =>
   items.map(({ label, key, color }) => ({ label, color, value: tokens?.[key] ?? 0 }));
 const stepEntries = (value: number) => [{ label: 'Assistant steps', color: parts[0].color, value }];
+const activityViews = { timeline: 'Timeline', hourOfDay: 'Hour of day' } as const;
+type ActivityDatum = ChartDatum & { dateTime: string; label: string; labelGap: number };
 
 function BreakdownBar(props: { datum: ChartDatum; max: number; state: InspectionState }) {
   return <div class="usage-chart-bar" aria-hidden="true">
@@ -52,9 +57,13 @@ function activityScale(peak: number) {
 }
 
 export function OverviewChart(input: {
-  activity: Array<UsageCounts & { date: string }>; from: number; to: number; metric: UsageMeasure; granularity?: UsageGranularity;
+  activity: ReadonlyArray<UsageCounts & { date: string }>; from: number; to: number; metric: UsageMeasure; granularity?: UsageGranularity;
+  activityByHour?: readonly UsageHourOfDay[]; view: ActivityView; onViewChange: (view: ActivityView) => void; active: boolean;
+  clockFormat?: ClockFormat;
 }) {
   const props = mergeProps({ granularity: 'day' } as const, input);
+  const clockLabels = createMemo(() => usageHourOfDayLabels(undefined, props.clockFormat === 'automatic' ? undefined : props.clockFormat));
+  const byHour = () => props.view === 'hourOfDay';
   const [hiddenParts, setHiddenParts] = createSignal<readonly typeof parts[number]['key'][]>([]);
   const togglePart = (key: typeof parts[number]['key']) => setHiddenParts(current =>
     current.includes(key) ? current.filter(hidden => hidden !== key) : [...current, key]);
@@ -80,20 +89,37 @@ export function OverviewChart(input: {
       };
     });
   });
-  const data = createMemo(() => {
+  const data = createMemo<ActivityDatum[]>(() => {
+    if (byHour()) return props.activityByHour?.map(({ hour, steps, tokens }) => {
+      const entries = props.metric === 'steps' ? stepEntries(steps) : tokenEntries(tokens, displayedParts());
+      const total = entries.reduce((sum, entry) => sum + entry.value, 0);
+      return { id: `hour-${hour}`, ...clockLabels()[hour], labelGap: 48, entries, total };
+    }) ?? [];
+    if (!props.activity.length) return [];
     const byDate = new Map(props.activity.map(day => [day.date, day]));
     return buckets().map(({ id, heading, label, labelGap }) => {
       const day = byDate.get(id);
       const entries = props.metric === 'steps' ? stepEntries(day?.steps ?? 0) : tokenEntries(day?.tokens, displayedParts());
-      return { id, heading, label, labelGap, entries, total: entries.reduce((total, entry) => total + entry.value, 0) };
+      return { id, dateTime: id, heading, label, labelGap, entries, total: entries.reduce((total, entry) => total + entry.value, 0) };
     });
   });
   const scale = createMemo(() => activityScale(data().reduce((peak, day) => Math.max(peak, day.total), 0)));
-  const state = useChartInspection(() => [props.activity, props.from, props.to, frequency(), props.metric, hiddenParts()]);
+  const state = useChartInspection(() => [props.activity, props.activityByHour, props.view, props.from, props.to, frequency(), props.metric, hiddenParts()]);
   const plot = usePlotWidth();
   const labelOffsets = createMemo(() => {
     const offsets = new Map<number, number>();
     const width = plot.width(), days = data(), bin = width / days.length;
+    if (!days.length || !width) return offsets;
+    if (byHour()) {
+      // Keep midnight and prefer regular clock intervals over labeling every bucket.
+      const gap = days[0].labelGap;
+      const stride = [1, 2, 3, 4, 6, 8, 12].find(hours => (hours + .5) * bin >= 1.5 * gap) ?? 24;
+      for (let i = 0; i < days.length; i += stride) {
+        const center = (i + .5) * bin;
+        offsets.set(i, Math.max(gap / 2, Math.min(center, width - gap / 2)) - center);
+      }
+      return offsets;
+    }
     // Keep the latest date (or Today so far) visible, then fit older labels.
     let next = width;
     for (let i = days.length - 1; i >= 0; i--) {
@@ -106,9 +132,9 @@ export function OverviewChart(input: {
     }
     return offsets;
   });
-  return <Show when={props.activity.length && data().length} fallback={<p class="secondary">No recorded activity in this period.</p>}>
-    <div class="usage-chart-card usage-overview-chart" ref={state.ref}>
-      <Show when={props.metric === 'tokens'}>
+  return <div class="usage-chart-card usage-overview-chart" ref={state.ref}>
+    <div class="usage-activity-controls">
+      <Show when={data().length && props.metric === 'tokens'}>
         <ul class="usage-chart-legend usage-activity-legend" aria-label="Token categories shown in Activity">
           <Index each={parts}>{part => <li>
             <button type="button" aria-pressed={!hiddenParts().includes(part().key)} onClick={() => togglePart(part().key)}>
@@ -118,7 +144,21 @@ export function OverviewChart(input: {
           </li>}</Index>
         </ul>
       </Show>
-      <div class="usage-activity-plot" ref={plot.ref} aria-label={`${usageBucketFrequency[frequency()]} recorded ${measure()}, earliest at left`}
+      <UsageDisclosure class="usage-activity-view" panelClass="usage-activity-menu" alignEnd active={props.active}
+        label={`Activity view: ${activityViews[props.view]}`}
+        summary={<>{activityViews[props.view]}<span class="usage-date-chevron" aria-hidden="true"/></>}>
+        {close => <div class="usage-toolbar-options">
+          <Index each={Object.keys(activityViews) as ActivityView[]}>{view => <button type="button" aria-pressed={props.view === view()}
+            onClick={() => { props.onViewChange(view()); close(); }}>{activityViews[view()]}</button>}</Index>
+        </div>}
+      </UsageDisclosure>
+    </div>
+    <Show when={data().length} fallback={<p class="secondary" role="status">{byHour()
+      ? 'Restart Inspector to see activity by hour of day. Timeline is still available.'
+      : 'No recorded activity in this period.'}</p>}>
+      <div class="usage-activity-plot" ref={plot.ref} aria-label={byHour()
+        ? `Recorded ${measure()} by local hour of day, combined across selected days, midnight at left`
+        : `${usageBucketFrequency[frequency()]} recorded ${measure()}, earliest at left`}
         {...state.keyboard(data)} onPointerLeave={state.leave}>
         <div class="usage-activity-grid" aria-hidden="true">
           <Index each={scale().ticks}>{tick => <div class="usage-activity-tick" classList={{ 'is-baseline': tick() === 0 }}
@@ -133,14 +173,16 @@ export function OverviewChart(input: {
           return <div class="usage-activity-column" {...inspectDatum(() => day().id, state)}
             style={{ '--activity-mark-height': `${day().total / scale().ceiling * 100}%` }}>
             <BreakdownBar datum={day()} max={day().total || 1} state={state}/>
-            <Show when={labelOffsets().has(i)}><time dateTime={day().id} style={{ transform: `translateX(${labelOffsets().get(i)}px)` }}>{day().label}</time></Show>
+            <Show when={labelOffsets().has(i)}><time dateTime={day().dateTime} style={{ transform: `translateX(${labelOffsets().get(i)}px)` }}>{day().label}</time></Show>
           </div>;
         }}</Index>
       </div>
-      <Show when={frequency() !== 'day'}><p class="usage-overview-axis">{usageBucketAxis[frequency()]}</p></Show>
+      <Show when={byHour()} fallback={<Show when={frequency() !== 'day'}><p class="usage-overview-axis">{usageBucketAxis[frequency()]}</p></Show>}>
+        <p class="usage-overview-axis">Local time · Counts combined across selected days</p>
+      </Show>
       <ChartInspection data={data()} state={state} totalLabel={`Total ${measure()}`}/>
-    </div>
-  </Show>;
+    </Show>
+  </div>;
 }
 
 export function RankedModelChart(props: { label: string; measure: UsageMeasure; rows: Array<{ label: string; tokens: UsageTokens; steps: number }> }) {

@@ -8,7 +8,7 @@ import { redactText } from './redact.js';
 import { projectToolUsage, readDelegations } from './usage-delegations.js';
 import { readSessionMetadata, unattributed, usageKey } from './usage-sessions.js';
 import { attachmentMetadata, distinctAttachments, splitPartColumns, v2SkillRangeSQL } from './usage-v2.js';
-import type { UsageCounts, UsageGranularity, UsageRange, UsageResponse, UsageTokens, UsageTopSession } from '../src/usage-types.js';
+import type { UsageCounts, UsageGranularity, UsageHourOfDay, UsageRange, UsageResponse, UsageTokens, UsageTopSession } from '../src/usage-types.js';
 export type { UsageRange } from '../src/usage-types.js';
 
 const hour = 3_600_000, day = 24 * hour;
@@ -40,7 +40,7 @@ export function parseUsageRange(query: Record<string, unknown>): UsageRange | un
   return { from, to, timezone, ...(granularity === undefined ? {} : { granularity }), ...scope };
 }
 
-function calendarBucketKey(timezone: string, granularity: Extract<UsageGranularity, 'week' | 'month'>) {
+function zonedTimestamp(timezone: string) {
   const formatter = new Intl.DateTimeFormat('en-US', { timeZone: timezone, timeZoneName: 'longOffset' });
   const offsetAt = (time: number) => {
     const offset = formatter.formatToParts(time).find(part => part.type === 'timeZoneName')!.value;
@@ -49,7 +49,6 @@ function calendarBucketKey(timezone: string, granularity: Extract<UsageGranulari
     return (offset[3] === '-' ? -1 : 1) * (hours * hour + minutes * 60_000 + seconds * 1000);
   };
   const offsets = new Map<number, number | null>();
-  const keys = new Map<number, string>();
   const dateLimit = 100_000_000 * day;
   return (time: number) => {
     const utcStart = Math.floor(time / day) * day;
@@ -61,7 +60,14 @@ function calendarBucketKey(timezone: string, granularity: Extract<UsageGranulari
       offset = first === last ? first : null;
       offsets.set(utcStart, offset);
     }
-    const localDay = Math.floor((time + (offset ?? offsetAt(time))) / day);
+    return time + (offset ?? offsetAt(time));
+  };
+}
+
+function calendarBucketKey(localTime: (time: number) => number, granularity: Extract<UsageGranularity, 'week' | 'month'>) {
+  const keys = new Map<number, string>();
+  return (time: number) => {
+    const localDay = Math.floor(localTime(time) / day);
     // The epoch was a Thursday; move back to Monday using civil-day arithmetic.
     const bucketDay = granularity === 'week' ? localDay - ((localDay + 3) % 7 + 7) % 7 : localDay;
     let key = keys.get(bucketDay);
@@ -172,6 +178,7 @@ function aggregate(db: DatabaseSync, tools: DatabaseSync, range: UsageRange, upd
   const summary = counts();
   const active = new Set<string>(), children = new Set<string>(), fresh = new Set<string>();
   const activity = new Map<string, { value: UsageCounts & { date: string }; active: Set<string>; children: Set<string>; fresh: Set<string> }>();
+  const activityByHour: UsageHourOfDay[] = Array.from({ length: 24 }, (_, hour) => ({ hour, steps: 0, tokens: emptyTokens() }));
   type BucketUsage = { sessions: Set<string>; steps: number; tokens: number };
   type TimelineSeries = { sessions: Set<string>; steps: number; tokens: UsageTokens; bucketsByRole: Map<'main' | 'subagent', Map<string, BucketUsage>> };
   const agents = new Map<string, TimelineSeries & { name: string }>();
@@ -224,8 +231,9 @@ function aggregate(db: DatabaseSync, tools: DatabaseSync, range: UsageRange, upd
     const p = Object.fromEntries(formatter.formatToParts(time).map(part => [part.type, part.value]));
     return `${p.year}-${p.month}-${p.day}`;
   };
+  const localTime = zonedTimestamp(range.timezone);
   const activityKey = range.granularity === 'week' || range.granularity === 'month'
-    ? calendarBucketKey(range.timezone, range.granularity) : dateKey;
+    ? calendarBucketKey(localTime, range.granularity) : dateKey;
   const bucket = (time: number) => {
     const date = activityKey(time);
     let value = activity.get(date);
@@ -268,7 +276,9 @@ function aggregate(db: DatabaseSync, tools: DatabaseSync, range: UsageRange, upd
     if (!modelEntry) { modelEntry = { provider, model, sessions: new Set(), steps: 0, tokens: emptyTokens(), bucketsByRole: new Map() }; models.set(modelKey, modelEntry); }
     modelEntry.sessions.add(row.session_id);
     const period = bucket(row.time_created).value;
-    if (step) { summary.steps++; period.steps++; entry.steps++; modelEntry.steps++; }
+    const localHour = Math.floor(localTime(row.time_created) / hour);
+    const hourOfDay = activityByHour[(localHour % 24 + 24) % 24];
+    if (step) { summary.steps++; period.steps++; hourOfDay.steps++; entry.steps++; modelEntry.steps++; }
     // Real elapsed hours keep the repeated hour on fall-back days distinct.
     const timeKey = range.granularity === 'hour' ? new Date(range.from + Math.floor((row.time_created - range.from) / hour) * hour).toISOString() : period.date;
     for (const series of [entry, modelEntry]) {
@@ -281,7 +291,7 @@ function aggregate(db: DatabaseSync, tools: DatabaseSync, range: UsageRange, upd
       if (value) rolePeriod.tokens += value.total;
     }
     if (!value) { warn('Some usage records have missing or invalid token counters; totals include only known counters.'); return; }
-    add(summary.tokens, value); add(period.tokens, value); add(entry.tokens, value); add(modelEntry.tokens, value);
+    add(summary.tokens, value); add(period.tokens, value); add(hourOfDay.tokens, value); add(entry.tokens, value); add(modelEntry.tokens, value);
   };
   const skill = (session: string, name: string, status: unknown, time: unknown) => {
     if (status !== 'completed' && status !== 'error') return;
@@ -453,6 +463,7 @@ function aggregate(db: DatabaseSync, tools: DatabaseSync, range: UsageRange, upd
     topSessions: topSessions('steps'),
     topSessionsByTokens: topSessions('tokens'),
     activity: [...activity.values()].map(({ value, active, children, fresh }) => ({ ...value, activeSessions: active.size, newSessions: fresh.size, subagentSessions: children.size })).sort((a, b) => a.date.localeCompare(b.date)),
+    activityByHour,
     agents: rankedAgents.map(({ name, sessions, steps, tokens }) => ({ name, sessions: sessions.size, steps, tokens })),
     agentActivity: rankedAgents.flatMap(({ name: agent, bucketsByRole }) => roleBuckets(bucketsByRole).map(bucket => ({ ...bucket, agent }))),
     models: rankedModels.map(({ provider, model, sessions, steps, tokens }) => ({ provider, model, sessions: sessions.size, steps, tokens })),
