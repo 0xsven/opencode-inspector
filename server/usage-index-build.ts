@@ -69,6 +69,41 @@ function durableTokens(raw: unknown) {
   return tokenMetadata(raw);
 }
 
+const usageEventTypes = "type IN ('session.created.1','session.forked.2','session.usage.recorded.1')";
+const usageEventIndex = 'event_aggregate_type_seq_idx';
+function usageEventRows(source: DatabaseSync) {
+  const e = json('data');
+  const select = `SELECT aggregate_id, type, created,
+    json_extract(${e}, '$.sessionID', '$.source', '$.tokens') metadata,
+    json_type(${e}, '$.location') location, json_type(${e}, '$.boundary') boundary`;
+  const scan = `${select} FROM event WHERE ${usageEventTypes}`;
+  // Find matching rowids in the narrow index before visiting the wide event
+  // rows. A partial index, expression key, or shadowed rowid is not equivalent.
+  const tables = source.prepare("PRAGMA table_list('event')").all();
+  const covering = tables.some(row => row.schema === 'main' && row.type === 'table' && row.wr === 0)
+    && !tables.some(row => row.schema === 'temp')
+    && source.prepare("PRAGMA main.index_list('event')").all().some(row => row.name === usageEventIndex && row.partial === 0)
+    && !source.prepare("PRAGMA main.table_xinfo('event')").all().some(row => String(row.name).toLowerCase() === 'rowid');
+  const keys = covering ? source.prepare(`PRAGMA main.index_xinfo('${usageEventIndex}')`).all() : [];
+  // Preserve the old scan order. Another index (or reverse scans) can change
+  // the implicit order of the original query; keep it as-is in those cases.
+  const rowidOrder = keys.some(row => row.name === 'type' && row.key === 1 && Number(row.cid) >= 0)
+    && keys.some(row => row.cid === -1)
+    && source.prepare('PRAGMA reverse_unordered_selects').get()?.reverse_unordered_selects === 0
+    && source.prepare(`EXPLAIN QUERY PLAN ${scan}`).get()?.detail === 'SCAN event';
+  let indexed;
+  if (rowidOrder) {
+    try {
+      indexed = source.prepare(`${select} FROM event WHERE rowid IN (
+        SELECT rowid FROM event INDEXED BY ${usageEventIndex} WHERE ${usageEventTypes}
+      ) ORDER BY rowid`);
+    } catch {
+      // The forced index can be unusable (e.g. an unavailable collation).
+    }
+  }
+  return (indexed ?? source.prepare(scan)).iterate() as Iterable<Row>;
+}
+
 /** Only allowlisted metadata crosses into the app-owned database. The caller
  * owns the source read snapshot and destination transaction. Exported for fixture
  * equivalence tests; production calls this exclusively in the indexing child.
@@ -112,19 +147,6 @@ export function projectUsageMetadata(source: DatabaseSync, target: DatabaseSync)
     }
     target.exec(`CREATE INDEX ${table}_session_time ON ${table}(session_id, time_created, id)`);
   }
-  if (complete('part')) {
-    const insert = target.prepare('INSERT INTO part VALUES (?,?,?,?,?,?)');
-    const key = (source.prepare("SELECT wr FROM pragma_table_list WHERE schema='main' AND name='part'").get() as Row).wr ? 'id' : 'rowid';
-    const p = json('p.data');
-    const rows = source.prepare(`SELECT p.id, p.message_id, p.session_id, p.time_created, p.time_updated,
-      json_extract(${p}, '$.callID', '$.state.status', '$.state.input.name', '$.state.metadata.name', '$.state.time.end') metadata
-      FROM part p NOT INDEXED WHERE json_extract(${p}, '$.tool')='skill' AND json_extract(${p}, '$.type')='tool' ORDER BY p.${key}`).iterate() as Iterable<Row>;
-    for (const row of rows) {
-      const [call, status, input, label, end] = JSON.parse(row.metadata);
-      const data = { type: 'tool', tool: 'skill', callID: callID(call), state: { status: terminal(status), metadata: { name: usageName(label ?? input) }, time: { end: completion(end) } } };
-      insert.run(id(row.id), id(row.message_id), id(row.session_id), timestamp(row.time_created), timestamp(row.time_updated), JSON.stringify(data));
-    }
-  }
   if (complete('session_message') && complete('session_v2')) {
     const attach = target.prepare("UPDATE session_message SET data=json_set(data, '$.skills', json(?)) WHERE id=?");
     for (const row of winningAttachmentOwners(source, complete('message') && complete('session')) as Iterable<Row>) {
@@ -133,13 +155,8 @@ export function projectUsageMetadata(source: DatabaseSync, target: DatabaseSync)
     }
   }
   if (complete('event')) {
-    const e = json('data');
     const insert = target.prepare('INSERT INTO event VALUES (?,?,?,?)');
-    const rows = source.prepare(`SELECT aggregate_id, type, created,
-      json_extract(${e}, '$.sessionID', '$.source', '$.tokens') metadata,
-      json_type(${e}, '$.location') location, json_type(${e}, '$.boundary') boundary
-      FROM event WHERE type IN ('session.created.1','session.forked.2','session.usage.recorded.1')`).iterate() as Iterable<Row>;
-    for (const row of rows) {
+    for (const row of usageEventRows(source)) {
       const [sessionID, sourceKind, tokens] = JSON.parse(row.metadata);
       const data = row.type === 'session.usage.recorded.1'
         // The live event reader JSON-decodes json_extract's single-column result.
@@ -151,7 +168,12 @@ export function projectUsageMetadata(source: DatabaseSync, target: DatabaseSync)
     }
     target.exec('CREATE INDEX event_session_type ON event(aggregate_id, type, created)');
   }
-  projectToolUsage(source, target, id);
+  const insertSkill = complete('part') ? target.prepare('INSERT INTO part VALUES (?,?,?,?,?,?)') : undefined;
+  projectToolUsage(source, target, id, insertSkill && (row => {
+    const [call, status, input, label, end] = JSON.parse(row.skill);
+    const data = { type: 'tool', tool: 'skill', callID: callID(call), state: { status: terminal(status), metadata: { name: usageName(label ?? input) }, time: { end: completion(end) } } };
+    insertSkill.run(id(row.record), id(row.message_id), id(row.session_id), timestamp(row.created), timestamp(row.time_updated), JSON.stringify(data));
+  }));
 }
 
 export async function buildUsageIndex(filename: string, destination: string, identity: string): Promise<IndexMetadata> {

@@ -479,11 +479,15 @@ test('record-specific V2 skill and delegation diagnostics only affect their owni
       ALTER TABLE session ADD COLUMN project_id TEXT;
       ALTER TABLE session_v2 ADD COLUMN project_id TEXT;`);
     db.prepare('INSERT INTO session VALUES(?,?,?,?)').run('clean-owner', null, from - 1000, 'clean');
+    db.prepare('INSERT INTO session_v2 VALUES(?,?,?,?,?)').run('clean-owner', null, from - 1000, null, 'clean');
+    db.prepare('INSERT INTO event VALUES(?,?,?,?,?)').run('clean-created', 'clean-owner', 'session.created.1', from - 1000, '{"sessionID":"clean-owner","location":{}}');
     db.prepare('INSERT INTO session_v2 VALUES(?,?,?,?,?)').run('dirty-owner', null, from - 1000, null, 'dirty');
     message(db, 'clean-message', 'clean-owner', from + 1000, 'build', 'assistant', 'legacy');
+    message(db, 'clean-message', 'clean-owner', from + 1000, 'build', 'assistant', 'v2', { content: {} }); // Tied legacy owner wins.
+    message(db, 'clean-no-content', 'clean-owner', from + 1000, 'build', 'assistant', 'v2');
     const load = { type: 'tool', id: 'attempt', name: 'skill', state: { status: 'completed', input: { name: 'notes' } }, time: { completed: from + 2000 } };
     message(db, 'dirty-duplicates', 'dirty-owner', from + 1000, 'build', 'assistant', 'v2', { content: [load, load] });
-    message(db, 'dirty-shape', 'dirty-owner', from - 500, 'build', 'assistant', 'v2', { content: {} });
+    message(db, 'dirty-shape', 'dirty-owner', from - 500, 'build', 'assistant', 'v2', { content: null });
     message(db, 'dirty-future', 'dirty-owner', to + 1000, 'build', 'assistant', 'v2', { content: [{ ...load, time: {} }] });
     const all = readUsage(filename, range);
     assert.ok(all.status === 'partial');
@@ -509,6 +513,10 @@ test('record-specific V2 skill and delegation diagnostics only affect their owni
     assert.ok(dirtyUnion.status === 'partial');
     assert.deepEqual(dirtyUnion.warnings, dirtyScope.warnings);
     assert.deepEqual(dirtyUnion.delegations.warnings, dirtyScope.delegations.warnings);
+    db.prepare('INSERT INTO session_message VALUES(?,?,?,?,?,?)').run('bad-json', 'clean-owner', from + 1000, from + 1000, '{', 'assistant');
+    const malformed = readUsage(filename, cleanRange);
+    assert.equal(malformed.status, 'partial');
+    assert.doesNotMatch(malformed.delegations.warnings.join(' '), /unsupported shape/);
     db.exec('DROP TABLE part');
     const structuralWarning = readUsage(filename, cleanRange);
     assert.ok(structuralWarning.status === 'partial');
@@ -840,8 +848,10 @@ test('split and inline tools compose by owner and ordinal, then count skill comp
       skill('other-tool', 'PRIVATE BLOCKED SKILL', from + 4),
     ] });
     db.prepare("UPDATE session_message SET time_updated=? WHERE id='mixed'").run(to + 1);
-    skillPart(db, 'superseded', 'mixed', 'root');
+    skillPart(db, 'superseded', 'mixed', 'root', 'completed', 'superseded-skill');
     taskPart(db, 'superseded-task', 'mixed', 'root');
+    skillPart(db, 'orphan-skill', 'missing-message', 'root', 'completed', 'orphan-skill');
+    taskPart(db, 'orphan-task', 'missing-message', 'root');
     part('mixed', 9, skill('same', 'higher-ordinal', from + 4));
     part('mixed', 8, delegationTool('call', 'higher-ordinal', from + 3));
     part('mixed', 1, skill('same', 'split', from + 3, 'error'));
@@ -881,6 +891,8 @@ test('split and inline tools compose by owner and ordinal, then count skill comp
       assert.match(JSON.stringify(plan), /SEARCH inspector_v2_skill USING INDEX inspector_v2_skill_completed \(completed>\? AND completed<\?\)/);
       assert.doesNotMatch(JSON.stringify(plan), /SCAN |TEMP B-TREE/);
       assert.equal(target.prepare('SELECT count(*) n FROM inspector_v2_skill').get()!.n, 4, 'one terminal row per winning skill, no duplicate call metadata');
+      assert.deepEqual(target.prepare("SELECT json_extract(data, '$.state.metadata.name') name FROM part ORDER BY rowid").all().map(row => row.name),
+        ['superseded-skill', 'orphan-skill'], 'retain skills in source order for later owner reconciliation, even though both paired tasks are ineligible');
     } finally { target.close(); }
     assert.doesNotMatch((await readFile(filename + '.projected')).toString(), /PRIVATE/);
   });
@@ -906,6 +918,80 @@ test('delivered V2 user messages count each attached skill ID once, not prompt t
     const target = new DatabaseSync(filename + '.projected');
     try { projectUsageMetadata(db, target); } finally { target.close(); }
     assert.doesNotMatch((await readFile(filename + '.projected')).toString(), /PRIVATE|LOSING (DUPLICATE|OWNER) LABEL/);
+  });
+});
+
+test('event projection uses covering rowid lookups without changing row order, duplicates, or metadata', async t => {
+  await fixture((db, filename) => {
+    session(db, 'root');
+    db.exec('ALTER TABLE event ADD COLUMN seq INTEGER');
+    const insert = db.prepare('INSERT INTO event VALUES(?,?,?,?,?,?)');
+    const usage = JSON.stringify({ source: 'title', tokens, private: 'PRIVATE' });
+    insert.run('usage-first', 'root', 'session.usage.recorded.1', from, usage, 10);
+    insert.run('skip', 'root', 'session.inbox.enqueued.1', 'ignored invalid timestamp', 'PRIVATE', 5);
+    insert.run('created', 'root', 'session.created.1', from - 1000, '{"sessionID":"root","location":{"directory":"PRIVATE"}}', 3);
+    insert.run('usage-duplicate', 'root', 'session.usage.recorded.1', from, usage, 11);
+    insert.run('broken', 'root', 'session.forked.2', from + 1, '{PRIVATE', 1);
+
+    const prepare = db.prepare.bind(db);
+    let eventSQL = '';
+    let rejectIndexedPrepare = false, indexedPrepareFailures = 0;
+    t.mock.method(db, 'prepare', (sql: string) => {
+      if (sql.startsWith('SELECT aggregate_id, type, created')) {
+        eventSQL = sql;
+        if (rejectIndexedPrepare && sql.includes('INDEXED BY')) {
+          indexedPrepareFailures++;
+          throw new Error('unusable covering index');
+        }
+      }
+      return prepare(sql);
+    });
+    const project = () => {
+      const target = new DatabaseSync(':memory:');
+      try {
+        projectUsageMetadata(db, target);
+        return target.prepare('SELECT * FROM event ORDER BY rowid').all();
+      } finally { target.close(); }
+    };
+    const expected = project();
+    const scanSQL = eventSQL;
+    assert.deepEqual(expected.map(row => row.type), ['session.usage.recorded.1', 'session.created.1', 'session.usage.recorded.1', 'session.forked.2']);
+    assert.deepEqual(expected[0], expected[2]);
+    assert.doesNotMatch(JSON.stringify(expected), /PRIVATE/);
+    const previous = readUsage(filename, range);
+    const name = 'event_aggregate_type_seq_idx';
+    db.exec(`CREATE INDEX ${name} ON event(aggregate_id,type,seq)`);
+    assert.deepEqual(project(), expected);
+    const plan = prepare(`EXPLAIN QUERY PLAN ${eventSQL}`).all().map(row => row.detail).join('\n');
+    assert.match(plan, /SEARCH event USING INTEGER PRIMARY KEY/);
+    assert.match(plan, /USING COVERING INDEX event_aggregate_type_seq_idx/);
+    const current = readUsage(filename, range);
+    assert.deepEqual(current, { ...previous, updatedAt: current.updatedAt });
+
+    rejectIndexedPrepare = true;
+    assert.deepEqual(project(), expected);
+    assert.equal(indexedPrepareFailures, 1);
+    assert.equal(eventSQL, scanSQL);
+    rejectIndexedPrepare = false;
+
+    db.exec("SAVEPOINT invalid; UPDATE event SET created='invalid' WHERE id='usage-first'");
+    assert.throws(project, /^Error: Invalid usage timestamp$/);
+    assert.match(eventSQL, /INDEXED BY/);
+    db.exec('ROLLBACK TO invalid; RELEASE invalid');
+
+    db.exec('CREATE INDEX event_type ON event(type)');
+    const oldOrder = prepare(scanSQL).all().map(({ type, created }) => expected.find(row => row.type === type && row.created === created));
+    assert.deepEqual(project(), oldOrder);
+    db.exec('DROP INDEX event_type');
+    for (const incompatible of [
+      `DROP INDEX ${name}; CREATE INDEX ${name} ON event(aggregate_id,type,seq) WHERE seq>3`,
+      `DROP INDEX ${name}; CREATE INDEX ${name} ON event(aggregate_id,lower(type),seq)`,
+      `DROP INDEX ${name}; CREATE INDEX ${name} ON event(aggregate_id,type,seq); ALTER TABLE event ADD COLUMN RoWiD AS (seq % 2)`,
+    ]) {
+      db.exec(incompatible);
+      assert.deepEqual(project(), expected);
+      assert.doesNotMatch(eventSQL, /INDEXED BY/);
+    }
   });
 });
 

@@ -17,7 +17,7 @@ const emptyStatuses = () => Object.fromEntries(statuses.map(status => [status, 0
  * this boundary; transcript/tool input/output/error objects are never selected.
  * The live reader uses this same projection in memory for accounting equivalence.
  */
-export function projectToolUsage(source: DatabaseSync, target: DatabaseSync, skillSessionID: (id: string) => string | null) {
+export function projectToolUsage(source: DatabaseSync, target: DatabaseSync, skillSessionID: (id: string) => string | null, writeLegacySkill?: (row: Row) => void) {
   const schema = new Map<string, Set<string>>();
   for (const row of source.prepare("SELECT name FROM sqlite_schema WHERE type='table'").all() as Row[]) {
     schema.set(row.name, new Set((source.prepare('SELECT name FROM pragma_table_info(?)').all(row.name) as Row[]).map(column => column.name)));
@@ -50,9 +50,50 @@ export function projectToolUsage(source: DatabaseSync, target: DatabaseSync, ski
     const result = insert.run(identity, session, message, time(created), name(caller), name(callee), state, key(child), key(resume));
     if (!result.changes) warn('Duplicate delegation call records were excluded.', session);
   };
+  const storeLegacy = (row: Row) => {
+    const [call, status] = JSON.parse(row.state), [callee, child, resume] = JSON.parse(row.labels);
+    store(row, [call, status, JSON.parse(row.caller), callee, child, resume, row.created], 'legacy');
+  };
+  const legacyPart = has('part', ['id', 'session_id', 'message_id', 'time_created', 'data']);
+  if (legacy && !legacyPart) warn('Legacy delegation tool history is unavailable.');
+  const partOrder = () => (source.prepare("SELECT wr FROM pragma_table_list WHERE schema='main' AND name='part'").get() as Row).wr ? 'id' : 'rowid';
+  const taskFields = (p: string, m: string, eligible?: string) => {
+    const field = (expression: string, alias: string) => `${eligible ? `CASE WHEN ${eligible} THEN ${expression} END` : expression} ${alias}`;
+    return [
+      field(`json_extract(${p}, '$.callID', '$.state.status')`, 'state'),
+      field(`json_quote(json_extract(${m}, '$.agent'))`, 'caller'),
+      field(`json_extract(${p}, '$.state.input.subagent_type', '$.state.metadata.sessionId', '$.state.input.task_id')`, 'labels'),
+    ].join(',');
+  };
+  if (writeLegacySkill) {
+    // Reject unrelated rows before looking up owners. Skills must be projected
+    // regardless of ownership; the range reader reconciles their owners later.
+    const p = safe('p.data'), m = safe('m.data');
+    const compare = legacy && v2;
+    const task = legacy ? 's.id IS NOT NULL' : '0';
+    const fields = legacy ? taskFields('p.data', m, task) + ',' : '';
+    const rows = source.prepare(`SELECT p.id record, p.time_created created, ${fields}
+      ${legacy ? 'COALESCE(m.id, p.message_id)' : 'p.message_id'} message_id,
+      ${legacy ? 'COALESCE(m.session_id, p.session_id)' : 'p.session_id'} session_id,
+      CASE WHEN NOT (${task}) THEN p.time_updated END time_updated,
+      CASE WHEN NOT (${task}) THEN json_extract(p.data, '$.callID', '$.state.status', '$.state.input.name', '$.state.metadata.name', '$.state.time.end') END skill
+      FROM part p NOT INDEXED
+      ${legacy ? `LEFT JOIN message m ON m.id=p.message_id AND m.session_id=p.session_id
+          AND json_extract(${p}, '$.tool')='task' AND json_extract(${m}, '$.role')='assistant'
+        LEFT JOIN session s ON s.id=m.session_id AND m.time_created >= s.time_created` : ''}
+      ${compare ? 'LEFT JOIN session_message o ON o.id=m.id AND o.session_id=m.session_id' : ''}
+      WHERE CASE WHEN json_valid(p.data) THEN CASE WHEN json_extract(p.data, '$.tool') IN (${legacy ? "'skill','task'" : "'skill'"})
+        THEN json_extract(p.data, '$.type')='tool' END END
+      ${legacy ? `AND (json_extract(${p}, '$.tool')='skill' OR (${task}${compare ? ' AND (o.id IS NULL OR m.time_updated >= o.time_updated)' : ''}))` : ''}
+      ORDER BY p.${partOrder()}`).iterate() as Iterable<Row>;
+    for (const row of rows) {
+      if (row.skill !== null) writeLegacySkill(row);
+      else storeLegacy(row);
+    }
+  }
   // Reconcile the owning message BEFORE expanding parts/content. IDs alone in a
   // different session are not overlaps. Ties keep the original legacy metadata.
-  for (const format of [legacy ? 'legacy' : '', v2 ? 'v2' : ''].filter(Boolean)) {
+  for (const format of [legacy && legacyPart && !writeLegacySkill ? 'legacy' : '', v2 ? 'v2' : ''].filter(Boolean)) {
     const isV2 = format === 'v2', table = isV2 ? 'session_message' : 'message', sessions = isV2 ? 'session_v2' : 'session';
     const other = isV2 ? 'message' : 'session_message';
     const join = legacy && v2 ? `LEFT JOIN ${other} o ON o.id=m.id AND o.session_id=m.session_id` : '';
@@ -60,28 +101,21 @@ export function projectToolUsage(source: DatabaseSync, target: DatabaseSync, ski
     const m = safe('m.data');
     const original = 'm.time_created >= s.time_created';
     if (!isV2) {
-      if (!has('part', ['id', 'session_id', 'message_id', 'time_created', 'data'])) { warn('Legacy delegation tool history is unavailable.'); continue; }
       const p = safe('p.data');
-      const order = (source.prepare("SELECT wr FROM pragma_table_list WHERE schema='main' AND name='part'").get() as Row).wr ? 'id' : 'rowid';
       const rows = source.prepare(`SELECT p.id record,m.id message_id,m.session_id,
-        json_extract(${p}, '$.callID', '$.state.status') state,
-        json_quote(json_extract(${m}, '$.agent')) caller,
-        json_extract(${p}, '$.state.input.subagent_type', '$.state.metadata.sessionId', '$.state.input.task_id') labels,
+        ${taskFields(p, m)},
         p.time_created created
         FROM part p NOT INDEXED CROSS JOIN message m ON m.id=p.message_id AND m.session_id=p.session_id
         CROSS JOIN session s ON s.id=m.session_id ${join}
         WHERE ${selected} AND ${original} AND json_extract(${m}, '$.role')='assistant'
         AND json_extract(${p}, '$.type')='tool' AND json_extract(${p}, '$.tool')='task'
-        ORDER BY p.${order}`).iterate() as Iterable<Row>;
-      for (const row of rows) {
-        const [call, status] = JSON.parse(row.state), [callee, child, resume] = JSON.parse(row.labels);
-        store(row, [call, status, JSON.parse(row.caller), callee, child, resume, row.created], format);
-      }
+        ORDER BY p.${partOrder()}`).iterate() as Iterable<Row>;
+      for (const row of rows) storeLegacy(row);
     } else {
       const invalidContent = source.prepare(`SELECT DISTINCT m.session_id
         FROM session_v2 s CROSS JOIN session_message m ON s.id=m.session_id ${join}
         WHERE ${selected} AND ${original} AND m.type='assistant'
-        AND json_type(${m}, '$.content') IS NOT NULL AND json_type(${m}, '$.content')!='array'`).iterate() as Iterable<Row>;
+        AND json_type(${m}, '$.content')!='array'`).iterate() as Iterable<Row>;
       for (const row of invalidContent) warn('Some V2 delegation content has an unsupported shape and was excluded.', hash(row.session_id));
       const insertSkill = target.prepare('INSERT INTO inspector_v2_skill VALUES(?,?,?,?,?)');
       const skillWarning = target.prepare(`INSERT INTO inspector_v2_skill_warning VALUES(?,?,?)
