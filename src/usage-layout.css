@@ -1,0 +1,298 @@
+.usage-page {
+  --overview-card-inset: 14px;
+  --overview-number-gutter: 36px;
+  --overview-column-gap: 8px;
+  --overview-content-start: calc(var(--overview-number-gutter) + var(--overview-column-gap));
+}
+.usage-lead { margin-top: 20px; }
+.usage-lead .usage-count-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+.usage-lead dd, .usage-provider { overflow-wrap: anywhere; }
+.usage-overview-list { list-style: none; padding: 0; margin: 0; }
+.usage-overview-list li + li { border-top: 1px solid var(--panel-line); }
+.usage-overview-list li, .usage-overview-list button {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 10px;
+}
+.usage-overview-list li { min-width: 0; padding: 9px var(--overview-card-inset); }
+.usage-overview-list li:has(> button) { padding: 0; }
+.usage-overview-list button { width: 100%; min-height: 44px; padding: 9px var(--overview-card-inset); text-align: start; color: inherit; }
+.usage-overview-list button:hover { background: var(--hover); color: var(--hover-text); }
+.usage-overview-list strong { font-weight: 500; overflow-wrap: anywhere; }
+.usage-overview-list small { display: block; color: var(--panel-secondary); font-size: 12px; overflow-wrap: anywhere; }
+.usage-overview-rank { flex: 0 0 22px; text-align: end; font-variant-numeric: tabular-nums; font-size: 12px; color: var(--panel-secondary); }
+.usage-overview-ranked-label { flex: 1; min-width: 0; }
+.usage-overview-count { flex: 0 0 auto; text-align: right; font-variant-numeric: tabular-nums; }
+.usage-overview-link { display: inline-flex; align-items: center; min-height: 36px; color: var(--accent); }
+.usage-section > h2:has(+ .usage-list-note) { margin-bottom: 4px; }
+.usage-list-note { font-size: 12px; margin-bottom: 8px; }
+
+.usage-overview-chart {
+  --activity-height: clamp(156px, 22vw, 216px);
+  padding-inline: var(--overview-card-inset);
+}
+.usage-activity-legend {
+  --legend-button-inset: 6px;
+  gap: 2px 4px;
+  margin-bottom: 24px;
+  padding-inline-start: calc(var(--overview-content-start) - var(--legend-button-inset));
+}
+.usage-activity-legend button {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 28px;
+  padding: 2px var(--legend-button-inset);
+  color: var(--panel-secondary);
+}
+.usage-activity-legend button span { border: 1px solid var(--token-color); background: var(--token-color); }
+.usage-activity-legend button[aria-pressed="false"] { text-decoration: line-through; }
+.usage-activity-legend button[aria-pressed="false"] span { background: transparent; }
+@media (pointer: coarse) {
+  .usage-activity-legend button { min-height: 44px; }
+}
+.usage-activity-plot {
+  position: relative;
+  display: grid;
+  grid-auto-flow: column;
+  grid-auto-columns: minmax(0, 1fr);
+  margin-block-start: 8px;
+  margin-inline-start: var(--overview-content-start);
+  font-size: 11px;
+}
+.usage-activity-grid { position: absolute; inset: 0 0 auto; height: var(--activity-height); pointer-events: none; }
+.usage-activity-empty {
+  position: absolute;
+  inset: 0 0 auto;
+  height: var(--activity-height);
+  display: grid;
+  place-items: center;
+  margin: 0;
+  padding: 8px;
+  color: var(--panel-secondary);
+  font-size: 12px;
+  text-align: center;
+  pointer-events: none;
+}
+.usage-activity-tick {
+  position: absolute;
+  inset-inline: 0;
+  height: 1px;
+  background: color-mix(in srgb, var(--panel-secondary) 16%, transparent);
+}
+.usage-activity-tick.is-baseline { background: color-mix(in srgb, var(--panel-secondary) 43%, transparent); }
+.usage-activity-tick span {
+  position: absolute;
+  inset-inline-end: calc(100% + var(--overview-column-gap));
+  top: 50%;
+  transform: translateY(-50%);
+  color: var(--panel-secondary);
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+.usage-activity-column {
+  position: relative;
+  display: grid;
+  grid-template: var(--activity-height) 16px / minmax(0, 1fr);
+  justify-items: center;
+  gap: 7px;
+  min-width: 0;
+  cursor: crosshair;
+}
+.usage-activity-column time { grid-row: 2; color: var(--panel-secondary); white-space: nowrap; pointer-events: none; }
+.usage-activity-column .usage-chart-bar {
+  grid-row: 1;
+  align-self: end;
+  width: min(75%, 44px);
+  height: var(--activity-mark-height);
+  flex-direction: column-reverse;
+  border-radius: 3px 3px 0 0;
+  background: transparent;
+}
+.usage-activity-column[data-active="true"] { background: var(--hover); }
+.usage-activity-column[data-active="true"] .usage-chart-bar:has(.usage-token-segment) { box-shadow: 0 0 0 1px var(--panel-text); }
+.usage-overview-axis { margin: 4px 0 0; margin-inline-start: var(--overview-content-start); color: var(--panel-secondary); font-size: 11px; text-align: center; }
+
+.usage-controls {
+  --usage-control-height: 28px;
+  --usage-option-height: 30px;
+  --usage-control-padding: 8px;
+  --usage-control-gap: 6px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 12px;
+}
+.usage-controls :is(.usage-toolbar-trigger, .usage-filter-trigger) {
+  height: var(--usage-control-height);
+  min-height: var(--usage-control-height);
+  padding-block: 0;
+  border: 0;
+  border-radius: 6px;
+  color: var(--secondary);
+  font-weight: 500;
+}
+.usage-controls :is(.usage-toolbar-trigger, .usage-filter-trigger):hover:where(:not(:disabled)) {
+  background: var(--hover);
+  color: var(--hover-text);
+}
+.usage-controls :is(details[open] > .usage-toolbar-trigger, .usage-filter-trigger[aria-expanded="true"]) {
+  background: var(--hover);
+  color: var(--panel-text);
+}
+.usage-controls > :not(.usage-filters) { flex: none; }
+.usage-controls :is(summary.usage-toolbar-trigger, .usage-filter-trigger) {
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--usage-control-gap);
+  padding-inline: var(--usage-control-padding);
+}
+.usage-controls summary.usage-toolbar-trigger { display: flex; position: relative; }
+.usage-controls summary.usage-toolbar-trigger::-webkit-details-marker { display: none; }
+.usage-date-short-label { display: none; }
+.usage-status { margin-inline-start: auto; }
+.usage-controls .usage-status summary { justify-content: center; gap: 4px; min-width: var(--usage-control-height); padding-inline: 6px; }
+.usage-status-warning { color: var(--accent); font-weight: 700; line-height: 1; }
+.usage-status-spinner {
+  width: 12px;
+  height: 12px;
+  border: 2px solid currentColor;
+  border-inline-end-color: transparent;
+  border-radius: 50%;
+  animation: usage-status-spin 900ms linear infinite;
+}
+@keyframes usage-status-spin { to { transform: rotate(1turn); } }
+@media (prefers-reduced-motion: reduce) {
+  .usage-status-spinner { animation: none; }
+}
+.usage-date-chevron { flex: none; width: 6px; height: 6px; border: solid currentColor; border-width: 0 1px 1px 0; transform: translateY(-2px) rotate(45deg); margin-inline: 2px; }
+.usage-toolbar-panel {
+  position: fixed;
+  z-index: 6;
+  visibility: hidden;
+  max-width: calc(100% - 2 * var(--workspace-inset));
+  max-height: var(--usage-menu-space);
+  overflow: auto;
+  overscroll-behavior: contain;
+  box-shadow: 0 6px 20px var(--shadow);
+}
+.usage-toolbar-panel:focus-visible { outline: 2px solid var(--focus-line); outline-offset: -2px; }
+.usage-date-menu { width: 12rem; }
+.usage-date-menu:has(.usage-date-form) { width: 24rem; }
+.usage-measure-menu { width: 8rem; }
+.usage-warning-panel { width: 430px; max-height: min(50dvh, var(--usage-menu-space)); padding: 14px 16px; overflow-wrap: anywhere; }
+.usage-warning-panel ul { margin: 8px 0 0; padding-inline-start: 20px; }
+.usage-warning-panel > div + div { margin-top: 14px; }
+.usage-warning-panel p { margin: 6px 0 0; }
+.usage-index-retry { margin-top: 8px; }
+.usage-warning-panel li + li { margin-top: 6px; }
+.usage-toolbar-options { padding: 4px; }
+.usage-toolbar-options button {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  width: 100%;
+  min-height: var(--usage-option-height);
+  padding: 4px 10px;
+  border-radius: 6px;
+  text-align: left;
+  color: var(--panel-text);
+}
+.usage-toolbar-options button:hover, .usage-toolbar-options button:focus-visible { background: var(--hover); color: var(--hover-text); }
+.usage-toolbar-options button[aria-pressed="true"]::after,
+.usage-filter-value:has(input:checked)::after {
+  content: "";
+  flex: none;
+  width: 5px;
+  height: 9px;
+  border: solid currentColor;
+  border-width: 0 1.5px 1.5px 0;
+  color: var(--panel-secondary);
+  transform: translateY(-1px) rotate(45deg);
+}
+.usage-date-apply { background: var(--selected); color: var(--selected-text); }
+.usage-date-custom { margin-top: 4px; border-top: 1px solid var(--panel-line); }
+.usage-date-form { display: grid; gap: 14px; padding: 12px; }
+.usage-date-fields { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
+.usage-date-fields label { display: grid; gap: 4px; min-width: 0; }
+.usage-date-fields input {
+  width: 100%;
+  min-width: 0;
+  min-height: 38px;
+  padding: 5px 8px;
+  color: var(--control-text);
+  background: var(--control-bg);
+  border: 1px solid var(--control-line);
+  border-radius: 6px;
+}
+.usage-date-actions { display: flex; justify-content: flex-end; gap: 8px; }
+.usage-period-details { margin-top: 12px; padding: 0 14px; }
+.usage-period-details summary { padding-block: 10px; }
+.usage-period-details > .usage-table-wrap, .usage-period-details > .usage-compact-table { margin: 0 0 12px; }
+.usage-period-details > p { padding-bottom: 12px; }
+.usage-period-details dl, .usage-compact-table dl {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(100px, 1fr));
+  gap: 10px 14px;
+  margin: 0 0 12px;
+}
+.usage-period-details dt, .usage-compact-table dt, .usage-compact-metrics small, .usage-provider { color: var(--panel-secondary); font-size: 12px; }
+.usage-period-details dd, .usage-compact-table dd { margin: 2px 0 0; overflow-wrap: anywhere; font-variant-numeric: tabular-nums; }
+.usage-provider { display: block; font-weight: 400; }
+.usage-compact-table { display: none; list-style: none; padding: 0; margin: 14px 0 0; }
+.usage-compact-table > li + li { border-top: 1px solid var(--panel-line); }
+.usage-compact-table details { padding-inline: 12px; }
+.usage-compact-table summary { padding-block: 10px; }
+.usage-compact-name { font-weight: 500; overflow-wrap: anywhere; }
+.usage-compact-name .usage-provider { padding-inline-start: 16px; }
+.usage-compact-metrics { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; margin: 5px 0 0 16px; }
+.usage-compact-metrics small, .usage-compact-metrics b { display: block; }
+.usage-compact-metrics b { font-weight: 500; overflow-wrap: anywhere; font-variant-numeric: tabular-nums; }
+.usage-compact-table dl { padding-inline-start: 16px; }
+.usage-full-table .technical-table { white-space: normal; width: 100%; }
+.usage-full-table th[scope="row"] { overflow-wrap: anywhere; }
+.usage-full-table .technical-table :is(th[aria-sort="descending"], td.usage-rank-value) { color: var(--panel-text); font-weight: 600; }
+
+@media (max-width: 900px) {
+  .usage-full-table { display: none; }
+  .usage-compact-table { display: block; }
+}
+@media (max-width: 700px) {
+  .usage-page { padding-block: 16px 32px; }
+  .usage-controls { --usage-control-height: 34px; --usage-option-height: 38px; }
+  .usage-lead .usage-count-grid { gap: 0; }
+  .usage-lead .usage-count-grid > div { padding: 10px 8px; }
+  .usage-lead .usage-count-grid dt { font-size: 12px; }
+  .usage-lead .usage-count-grid dd { font-size: 18px; }
+  .usage-section { margin-top: 22px; }
+  .usage-section h2 { margin-bottom: 10px; }
+}
+@media (pointer: coarse) {
+  .usage-controls { --usage-control-height: 44px; --usage-option-height: 44px; }
+}
+@media (max-width: 640px) {
+  .usage-controls > .usage-filters { flex: 1 1 auto; }
+  .usage-warning-panel { max-height: var(--usage-menu-space); }
+}
+@media (max-width: 350px) {
+  .usage-controls {
+    --usage-control-padding: 6px;
+    --usage-control-gap: 4px;
+    gap: 4px;
+  }
+  .usage-controls > .usage-filters { flex: 1 1 4rem; max-width: none; }
+  .usage-controls > .usage-date-options { flex: 0 1 auto; min-width: 0; }
+  .usage-controls .usage-status { margin-inline-start: auto; }
+  .usage-filter-trigger { gap: 4px; }
+  .usage-date-label { display: none; }
+  .usage-date-short-label { display: inline; }
+  .usage-date-fields { grid-template-columns: 1fr; }
+}
+@media (min-width: 900px) {
+  .usage-overview-lists { display: grid; grid-template-columns: 2fr 3fr; gap: 16px; }
+  .usage-overview-lists > section { min-width: 0; }
+  .usage-overview-lists > :only-child { grid-column: 1 / -1; }
+}

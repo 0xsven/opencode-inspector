@@ -1,9 +1,10 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { createElement } from 'react';
-import { renderToStaticMarkup } from 'react-dom/server';
-import { DelegationDetails, DelegationTrees, delegationGraph, delegationLayout, delegationRadius } from '../src/DelegationTrees.js';
+import { loadComponents, renderComponent } from './solid-render.js';
+import { delegationGraph, delegationLayout, delegationRadius } from '../src/delegation-layout.js';
 import type { UsageDelegationNode, UsageDelegations } from '../src/usage-types.js';
+const { DelegationDetails, DelegationTrees } = await loadComponents<typeof import('../src/DelegationTrees.js')>('/src/DelegationTrees.tsx');
+const render = (component: any, props?: any) => renderComponent(component, props ?? {});
 
 const statuses = { pending: 0, streaming: 0, running: 0, completed: 0, error: 0, unknown: 0 };
 function node(id: string, agent: string | null, parentId: string | null, attempts: number, options: Partial<UsageDelegationNode> = {}): UsageDelegationNode {
@@ -26,10 +27,10 @@ test('delegation layout uses visible shared maximum and stable Plan/Build/main r
 });
 
 test('SVG markup retains attributed nodes, accessible actions, exact external counts and trailing diagnostics', () => {
-  const html = renderToStaticMarkup(createElement(DelegationTrees, { delegations: dto([
+  const html = render(DelegationTrees, { delegations: dto([
     node('root', 'build', null, 2), node('context', 'old-agent', 'root', 0),
     node('child', 'child', 'context', 1, { ancestry: 'unknown' }),
-  ]) }));
+  ]) });
   assert.match(html, /<svg class="delegation-graph"/);
   assert.equal((html.match(/role="button"/g) || []).length, 3);
   assert.equal((html.match(/<path /g) || []).length, 2);
@@ -64,7 +65,7 @@ test('unattributed branches are removed before layout and scale without promotin
   assert.equal(maxAttempts, 12);
   assert.deepEqual(roots.map(root => root.id), ['p']);
   assert.deepEqual(delegationGraph(roots[0], maxAttempts).nodes.map(point => point.node.id), ['p', 'known']);
-  const html = renderToStaticMarkup(createElement(DelegationTrees, { delegations: data }));
+  const html = render(DelegationTrees, { delegations: data });
   assert.equal((html.match(/role="button"/g) || []).length, 2);
   assert.match(html, /12 outgoing/);
   assert.doesNotMatch(html, /hidden-child|untrusted-root|also-hidden|untrusted-child|still-hidden/);
@@ -128,35 +129,35 @@ test('broad and deep 2000-node trees retain every node without recursive renderi
     assert.equal(graph.links.length, 1999);
     assert.ok(Number.isFinite(graph.width) && Number.isFinite(graph.height));
     assert.equal(new Set(graph.nodes.map(point => `${point.x},${point.y}`)).size, 2000);
-    const html = renderToStaticMarkup(createElement(DelegationTrees, { delegations: dto(data) }));
+    const html = render(DelegationTrees, { delegations: dto(data) });
     assert.equal((html.match(/role="button"/g) || []).length, 2000);
   }
 });
 
 test('compact details show name, exact count and only nonzero statuses, including unknown', () => {
-  const html = renderToStaticMarkup(createElement(DelegationDetails, { node: node('c', 'quick-build', 'p', 4, { ancestry: 'ambiguous', statuses: { ...statuses, error: 2, pending: 1, unknown: 1 } }) }));
+  const html = render(DelegationDetails, { node: node('c', 'quick-build', 'p', 4, { ancestry: 'ambiguous', statuses: { ...statuses, error: 2, pending: 1, unknown: 1 } }) });
   assert.match(html, />quick-build</);
-  assert.match(html, /4 recorded incoming attempts/);
+  assert.match(html, /4(?:<[^>]*>)* recorded(?:<[^>]*>)* incoming(?:<[^>]*>)* attempts/);
   assert.match(html, /<dt>error<\/dt><dd>2<\/dd>/);
   assert.match(html, /<dt>pending<\/dt><dd>1<\/dd>/);
   assert.match(html, /<dt>unknown<\/dt><dd>1<\/dd>/);
   assert.doesNotMatch(html, /<dt>completed<|<dt>streaming<|<dt>running</);
   assert.doesNotMatch(html, /Attribution:|Ancestry:|not necessarily|delegation-detail-hint|press Enter/);
-  const context = renderToStaticMarkup(createElement(DelegationDetails, { node: node('old', 'old-agent', 'p', 0) }));
-  assert.match(context, /0 recorded incoming attempts/);
+  const context = render(DelegationDetails, { node: node('old', 'old-agent', 'p', 0) });
+  assert.match(context, /0(?:<[^>]*>)* recorded(?:<[^>]*>)* incoming(?:<[^>]*>)* attempts/);
   assert.match(context, /Context only · zero period attempts/);
   assert.doesNotMatch(context, /<dl/);
-  const outgoing = renderToStaticMarkup(createElement(DelegationDetails, { node: node('r', 'Build', null, 5) }));
-  assert.match(outgoing, /5 recorded outgoing attempts/);
+  const outgoing = render(DelegationDetails, { node: node('r', 'Build', null, 5) });
+  assert.match(outgoing, /5(?:<[^>]*>)* recorded(?:<[^>]*>)* outgoing(?:<[^>]*>)* attempts/);
   assert.match(outgoing, /<dt>completed<\/dt><dd>5<\/dd>/);
 });
 
 test('missing DTO and empty periods keep their distinct fallback messages', () => {
-  assert.match(renderToStaticMarkup(createElement(DelegationTrees)), /not available in this response yet/);
-  assert.match(renderToStaticMarkup(createElement(DelegationTrees, { delegations: dto([]) })), /No delegation attempts or delegation context recorded in this period/);
-  const unattributed = renderToStaticMarkup(createElement(DelegationTrees, { delegations: dto([
+  assert.match(render(DelegationTrees), /not available in this response yet/);
+  assert.match(render(DelegationTrees, { delegations: dto([]) }), /No delegation attempts or delegation context recorded in this period/);
+  const unattributed = render(DelegationTrees, { delegations: dto([
     node('unknown', null, null, 2), node('child', 'named-child', 'unknown', 2),
-  ]) }));
+  ]) });
   assert.match(unattributed, /No attributed delegation paths to display/);
   assert.match(unattributed, /recorded totals are unchanged/);
   assert.doesNotMatch(unattributed, /No delegation attempts or delegation context recorded|<svg/);

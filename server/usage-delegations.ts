@@ -1,14 +1,12 @@
 import type { DatabaseSync } from 'node:sqlite';
-import { createHash } from 'node:crypto';
 import { usageName, type UsageRange } from './usage.js';
+import { projectSessionMetadata, usageKey as hash, validSessionKey as validName } from './usage-sessions.js';
 import { splitPartColumns, v2ToolMetadata } from './usage-v2.js';
 import type { UsageDelegations, UsageDelegationNode, UsageDelegationStatus } from '../src/usage-types.js';
 
 type Row = Record<string, any>;
 type Call = { key: string; session: string; created: number | null; caller: string | null; callee: string | null; status: UsageDelegationStatus; child: string | null };
 const statuses = ['pending', 'streaming', 'running', 'completed', 'error', 'unknown'] as const;
-const hash = (value: unknown) => createHash('sha256').update(JSON.stringify(value)).digest('hex');
-const validName = (value: unknown): value is string => typeof value === 'string' && value.length > 0 && value.length <= 256 && !/[\x00-\x1f]/.test(value);
 const name = (value: unknown) => validName(value) ? usageName(value) : null;
 const key = (value: unknown) => validName(value) ? hash(value) : null;
 const time = (value: unknown) => typeof value === 'number' && Number.isSafeInteger(value) && value >= 0 && Number.isFinite(new Date(value).getTime()) ? value : null;
@@ -27,24 +25,15 @@ export function projectToolUsage(source: DatabaseSync, target: DatabaseSync, ski
   const has = (table: string, columns: string[]) => columns.every(column => schema.get(table)?.has(column));
   const legacy = has('session', ['id', 'parent_id', 'time_created']) && has('message', ['id', 'session_id', 'time_created', 'time_updated', 'data']);
   const v2 = has('session_v2', ['id', 'parent_id', 'time_created', 'fork_session_id']) && has('session_message', ['id', 'session_id', 'time_created', 'time_updated', 'data', 'type']);
-  target.exec(`CREATE TABLE inspector_delegation_session(key TEXT PRIMARY KEY, parent TEXT, known INTEGER NOT NULL);
-    CREATE TABLE inspector_delegation_call(key TEXT PRIMARY KEY, session TEXT NOT NULL, message TEXT NOT NULL,
+  target.exec(`CREATE TABLE inspector_delegation_call(key TEXT PRIMARY KEY, session TEXT NOT NULL, message TEXT NOT NULL,
       created INTEGER, caller TEXT, callee TEXT, status TEXT NOT NULL, child TEXT, resume TEXT);
-    CREATE TABLE inspector_delegation_warning(message TEXT PRIMARY KEY);
+    CREATE TABLE inspector_delegation_warning(message TEXT NOT NULL, owner TEXT NOT NULL, PRIMARY KEY(message,owner));
     CREATE TABLE inspector_v2_skill(session_id TEXT NOT NULL, owner_created INTEGER NOT NULL, completed INTEGER NOT NULL, status TEXT NOT NULL, name TEXT NOT NULL);
-    CREATE TABLE inspector_v2_skill_warning(message TEXT PRIMARY KEY, earliest INTEGER NOT NULL);`);
-  const warnings = new Set<string>();
-  const warn = (text: string) => warnings.add(text);
-  const insertSession = target.prepare(`INSERT INTO inspector_delegation_session VALUES(?,?,?)
-    ON CONFLICT(key) DO UPDATE SET known=CASE WHEN parent IS excluded.parent AND known=1 AND excluded.known=1 THEN 1 ELSE 0 END`);
-  for (const table of [legacy ? 'session' : '', v2 ? 'session_v2' : ''].filter(Boolean)) {
-    for (const row of source.prepare(`SELECT id,parent_id FROM ${table}`).iterate() as Iterable<Row>) {
-      const session = key(row.id);
-      if (!session) { warn('Some delegation sessions have invalid identities; ancestry is incomplete.'); continue; }
-      const parent = key(row.parent_id);
-      insertSession.run(session, parent, row.parent_id === null || parent !== null ? 1 : 0);
-    }
-  }
+    CREATE TABLE inspector_v2_skill_warning(message TEXT NOT NULL, owner TEXT NOT NULL, earliest INTEGER NOT NULL,
+      PRIMARY KEY(message,owner));`);
+  const insertWarning = target.prepare('INSERT OR IGNORE INTO inspector_delegation_warning VALUES(?,?)');
+  const warn = (text: string, owner = '') => { insertWarning.run(text, owner); };
+  projectSessionMetadata(source, target, schema, [legacy ? 'session' : '', v2 ? 'session_v2' : ''].filter(Boolean), warn);
   if ((schema.has('message') && !legacy) || (schema.has('session_message') && !v2)) warn('Some delegation history has an unsupported schema and was excluded.');
   const split = has('session_part', splitPartColumns);
   if (v2 && schema.has('session_part') && !split) warn('V2 split delegation history has an unsupported schema and was excluded.');
@@ -52,14 +41,14 @@ export function projectToolUsage(source: DatabaseSync, target: DatabaseSync, ski
   const store = (row: Row, metadata: unknown[], format: string) => {
     const [call, status, caller, callee, child, resume, created] = metadata;
     const session = key(row.session_id), message = key(row.message_id);
-    if (!session || !message) { warn('Some delegation records have invalid owner identities and were excluded.'); return; }
+    if (!session || !message) { warn('Some delegation records have invalid owner identities and were excluded.', hash(row.session_id)); return; }
     const callKey = format === 'legacy' ? key(call) : typeof call === 'string' && call ? hash(call) : null;
-    if (!callKey) warn('Some delegation call identities are missing or invalid; distinct record-local identities were used.');
+    if (!callKey) warn('Some delegation call identities are missing or invalid; distinct record-local identities were used.', session);
     const identity = hash([session, message, callKey ?? [format, row.record]]);
     const state = statuses.includes(status as UsageDelegationStatus) ? status as UsageDelegationStatus : 'unknown';
-    if (state === 'unknown') warn('Some delegation records have unknown lifecycle states.');
+    if (state === 'unknown') warn('Some delegation records have unknown lifecycle states.', session);
     const result = insert.run(identity, session, message, time(created), name(caller), name(callee), state, key(child), key(resume));
-    if (!result.changes) warn('Duplicate delegation call records were excluded.');
+    if (!result.changes) warn('Duplicate delegation call records were excluded.', session);
   };
   // Reconcile the owning message BEFORE expanding parts/content. IDs alone in a
   // different session are not overlaps. Ties keep the original legacy metadata.
@@ -89,30 +78,30 @@ export function projectToolUsage(source: DatabaseSync, target: DatabaseSync, ski
         store(row, [call, status, JSON.parse(row.caller), callee, child, resume, row.created], format);
       }
     } else {
-      const invalidContent = source.prepare(`SELECT EXISTS(SELECT 1
+      const invalidContent = source.prepare(`SELECT DISTINCT m.session_id
         FROM session_v2 s CROSS JOIN session_message m ON s.id=m.session_id ${join}
         WHERE ${selected} AND ${original} AND m.type='assistant'
-        AND json_type(${m}, '$.content') IS NOT NULL AND json_type(${m}, '$.content')!='array') invalid`).get() as Row;
-      if (invalidContent.invalid) warn('Some V2 delegation content has an unsupported shape and was excluded.');
+        AND json_type(${m}, '$.content') IS NOT NULL AND json_type(${m}, '$.content')!='array'`).iterate() as Iterable<Row>;
+      for (const row of invalidContent) warn('Some V2 delegation content has an unsupported shape and was excluded.', hash(row.session_id));
       const insertSkill = target.prepare('INSERT INTO inspector_v2_skill VALUES(?,?,?,?,?)');
-      const skillWarning = target.prepare(`INSERT INTO inspector_v2_skill_warning VALUES(?,?)
-        ON CONFLICT(message) DO UPDATE SET earliest=min(earliest,excluded.earliest)`);
+      const skillWarning = target.prepare(`INSERT INTO inspector_v2_skill_warning VALUES(?,?,?)
+        ON CONFLICT(message,owner) DO UPDATE SET earliest=min(earliest,excluded.earliest)`);
       for (const row of v2ToolMetadata(source, legacy, split)) {
         if (row.duplicate) {
-          if (row.tool === 'skill') skillWarning.run('Duplicate V2 skill records were excluded.', row.owner_created);
-          else warn('Duplicate delegation call records were excluded.');
+          if (row.tool === 'skill') skillWarning.run('Duplicate V2 skill records were excluded.', hash(row.session_id), row.owner_created);
+          else warn('Duplicate delegation call records were excluded.', hash(row.session_id));
           continue;
         }
         if (row.tool === 'skill') {
           const [status, input, inputID, label, end] = JSON.parse(row.metadata);
           if (status !== 'completed' && status !== 'error') continue;
           if (typeof end !== 'number' || !Number.isFinite(end)) {
-            skillWarning.run('Some terminal skill attempts lack a completion timestamp and could not be assigned to the range.', row.owner_created);
+            skillWarning.run('Some terminal skill attempts lack a completion timestamp and could not be assigned to the range.', hash(row.session_id), row.owner_created);
           } else insertSkill.run(skillSessionID(row.session_id), row.owner_created, end, status, usageName(label ?? input ?? inputID));
           continue;
         }
         const [status, callee, child, resume, created] = JSON.parse(row.metadata);
-        if (row.tool === 'task') warn('V2 task records may retain migrated creation timestamps or interrupted lifecycle states.');
+        if (row.tool === 'task') warn('V2 task records may retain migrated creation timestamps or interrupted lifecycle states.', hash(row.session_id));
         store(row, [row.call, status, JSON.parse(row.caller), callee, child, resume, created], row.storage === 0 ? 'split' : 'inline');
       }
     }
@@ -120,8 +109,6 @@ export function projectToolUsage(source: DatabaseSync, target: DatabaseSync, ski
   target.exec(`CREATE INDEX inspector_delegation_time ON inspector_delegation_call(created,key);
     CREATE INDEX inspector_delegation_child ON inspector_delegation_call(child,created,key);
     CREATE INDEX inspector_v2_skill_completed ON inspector_v2_skill(completed);`);
-  const insertWarning = target.prepare('INSERT INTO inspector_delegation_warning VALUES(?)');
-  for (const warning of warnings) insertWarning.run(warning);
 }
 
 type Segment = Pick<UsageDelegationNode, 'agent' | 'role' | 'ancestry'>;
@@ -139,9 +126,19 @@ export const delegationInboundSQL = {
     WHERE child=? AND created IS NULL ORDER BY key LIMIT ?`,
 };
 
-export function readDelegations(db: DatabaseSync, range: UsageRange): UsageDelegations {
-  const warnings = new Set((db.prepare('SELECT message FROM inspector_delegation_warning ORDER BY message').all() as Array<{ message: string }>).map(row => row.message));
-  const unlocatedAttempts = (db.prepare('SELECT count(*) n FROM inspector_delegation_call WHERE created IS NULL').get() as { n: number }).n;
+export function readDelegations(db: DatabaseSync, range: UsageRange, include: (session: string, inRange: boolean) => boolean): UsageDelegations {
+  const warnings = new Set<string>();
+  // Projection warnings describe coverage of the snapshot, including records
+  // without usable dates. Retain that time basis, but scope attributable rows.
+  const scoped = range.project || range.projects;
+  const projectedWarnings = db.prepare(scoped
+    ? 'SELECT message,owner FROM inspector_delegation_warning'
+    : 'SELECT DISTINCT message FROM inspector_delegation_warning').iterate() as Iterable<{ message: string; owner?: string }>;
+  for (const { message, owner } of projectedWarnings) if (!owner || include(owner, false)) warnings.add(message);
+  const unlocatedAttempts = scoped
+    ? (db.prepare('SELECT session,count(*) n FROM inspector_delegation_call WHERE created IS NULL GROUP BY session').all() as Array<{ session: string; n: number }>)
+      .reduce((sum, { session, n }) => sum + (include(session, false) ? n : 0), 0)
+    : (db.prepare('SELECT count(*) n FROM inspector_delegation_call WHERE created IS NULL').get() as { n: number }).n;
   if (unlocatedAttempts) warnings.add('Some delegation attempts lack a valid creation timestamp and cannot be assigned to a period.');
   const session = db.prepare('SELECT parent,known FROM inspector_delegation_session WHERE key=?');
   const inbound = db.prepare(delegationInboundSQL.timed);
@@ -209,6 +206,7 @@ export function readDelegations(db: DatabaseSync, range: UsageRange): UsageDeleg
   const rows = db.prepare(`SELECT key,session,created,caller,callee,status,child FROM inspector_delegation_call
     WHERE created>=? AND created<? ORDER BY created,key`).iterate(range.from, range.to) as Iterable<Call>;
   for (const call of rows) {
+    if (!include(call.session, true)) continue;
     totalAttempts++;
     const resolved = resolve(call, new Set(), { remaining: maxWork });
     let reason = resolved.reason;

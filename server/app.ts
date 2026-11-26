@@ -1,5 +1,6 @@
 import express from 'express';
 import path from 'node:path';
+import { parse as parseQuery } from 'node:querystring';
 import { globalConfigRoot } from './config-root.js';
 import { inspect } from './parser.js';
 import { categorySlugs, parseLocation } from '../src/navigation.js';
@@ -39,10 +40,24 @@ export function createApp({ root = process.env.OPENCODE_CONFIG_ROOT || globalCon
   app.get('/api/snapshot', async (_req, res) => {
     try { res.json(await inspect(root)); } catch { res.status(500).json({ error: 'Could not read the configured directory. Check the path and local file permissions.' }); }
   });
+  app.get('/api/usage/status', async (_req, res) => {
+    res.json(await usage.status(await database));
+  });
+  app.get('/api/usage/index', async (req, res) => {
+    const start = req.url.indexOf('?');
+    const { mode, ...extra } = parseQuery(start < 0 ? '' : req.url.slice(start + 1), '&', '=', { maxKeys: 0 });
+    if ((mode !== 'observe' && mode !== 'rebuild') || Object.keys(extra).length) {
+      return void res.status(400).json({ error: 'Expected exactly one mode=observe|rebuild.' });
+    }
+    const filename = await database;
+    res.json(await (mode === 'observe' ? usage.observe(filename) : usage.rebuild(filename)));
+  });
   app.get('/api/usage', async (req, res) => {
-    const { refresh, ...query } = req.query;
+    // Validate every occurrence; Express's default parser silently truncates after 1,000 pairs.
+    const start = req.url.indexOf('?');
+    const { refresh, ...query } = parseQuery(start < 0 ? '' : req.url.slice(start + 1), '&', '=', { maxKeys: 0 });
     const range = parseUsageRange(query);
-    if (!range || (refresh !== undefined && refresh !== '1')) return void res.status(400).json({ error: 'Expected from/to epoch milliseconds, an exclusive end within 32 days (26 hours for hourly granularity), an IANA timezone, and optional granularity=hour|day and refresh=1.' });
+    if (!range || (refresh !== undefined && refresh !== '1')) return void res.status(400).json({ error: 'Expected from/to epoch milliseconds with an exclusive end, an IANA timezone, optional granularity=hour|day|week|month (limits: 26 hours, 32 days by default, 100 days, 100 years, respectively), optional refresh=1, and up to 50 project values (lowercase SHA-256 IDs or unattributed).' });
     res.json(await usage.read(await database, range, refresh === '1'));
   });
   app.use('/api', (_req, res) => { res.status(404).json({ error: 'Not found' }); });
@@ -55,7 +70,7 @@ export function createApp({ root = process.env.OPENCODE_CONFIG_ROOT || globalCon
       if (req.method !== 'GET' && req.method !== 'HEAD') return next();
       const view = parseLocation(req.path);
       // The shared codec includes Usage/Settings subpages and their legacy aliases.
-      const knownPage = ['settings', 'usage'].includes(req.path.split('/')[1]) || Object.values(categorySlugs).includes(req.path.split('/')[1]);
+      const knownPage = ['settings', 'usage', 'config'].includes(req.path.split('/')[1]) || Object.values(categorySlugs).includes(req.path.split('/')[1]);
       if (!view.invalid || knownPage) return res.status(view.invalid ? 404 : 200).sendFile(path.join(clientDirectory, 'index.html'));
       // Browser navigations get an honest not-found view; missing files stay 404.
       if (req.accepts('html') && !path.extname(req.path)) return res.status(404).sendFile(path.join(clientDirectory, 'index.html'));

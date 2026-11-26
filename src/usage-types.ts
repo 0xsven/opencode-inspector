@@ -10,10 +10,34 @@ export interface UsageTokens {
   total: number;
 }
 
-export type UsageRange = { from: number; to: number; timezone: string; granularity?: 'hour' | 'day' };
+export type UsageGranularity = 'hour' | 'day' | 'week' | 'month';
+export type UsageRange = {
+  from: number; to: number; timezone: string; granularity?: UsageGranularity;
+  project?: string;
+  /** Sorted distinct IDs for a selection of two or more; replaces `project`. */
+  projects?: string[];
+};
+
+export interface UsageProject {
+  /** Opaque, source-derived ID or the reserved `unattributed` bucket. */
+  id: string;
+  name: string;
+  sessions: number;
+  steps: number;
+  tokens: number;
+}
+
+export interface UsageTopSession {
+  id: string;
+  title: string | null;
+  project: string | null;
+  steps: number;
+  /** Known valid in-period tokens attributed to this root and its verified descendants. */
+  tokens: number;
+}
 
 interface UsageTimelineBucket {
-  /** Local YYYY-MM-DD for daily buckets, UTC ISO start instant for hourly buckets. */
+  /** Local YYYY-MM-DD at the bucket start, or a UTC ISO instant for hourly buckets. */
   date: string;
   /** Known valid tokens only. */
   tokens: number;
@@ -76,6 +100,12 @@ export type UsageResponse = {
   formats: string[];
   warnings: string[];
   summary: UsageCounts;
+  /** Period totals across all projects, even when the rest of the response is scoped. */
+  projects: UsageProject[];
+  /** Up to ten sessions, ranked by in-period assistant steps in the selected scope. */
+  topSessions: UsageTopSession[];
+  /** Up to ten sessions, ranked by known in-period tokens in the selected scope. */
+  topSessionsByTokens: UsageTopSession[];
   activity: Array<UsageCounts & { date: string }>;
   /** Historical assistant attribution; missing names and durable auxiliary usage
    * (compaction/title/generate, with no assistant step) are grouped as "Unknown".
@@ -103,14 +133,14 @@ export interface UsageIndexState {
   state: 'indexing' | 'refreshing' | 'ready' | 'failed';
   /** Time the source read snapshot was pinned, not build completion/request time. */
   indexedAt: string | null;
-  /** null means the source could not be checked. Changes do not trigger a rebuild. */
+  /** null means the source could not be checked. Status checks can wake a rebuild. */
   sourceChanged: boolean | null;
   /** Sanitized lifecycle error; no filenames, SQL or source content. */
   message?: string;
 }
 
-/** GET /api/usage. Poll plain GET only during indexing/refreshing. Send refresh=1
- * once for an explicit rebuild (also the only retry after a failed initial build).
+/** GET /api/usage. Check GET /api/usage/status for freshness and progress.
+ * Send refresh=1 once for an explicit rebuild (the only retry after a failed initial build).
  */
 export type IndexedUsageResponse = (UsageResponse & { index: UsageIndexState }) | {
   status: 'indexing';

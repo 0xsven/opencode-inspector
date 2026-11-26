@@ -1,6 +1,8 @@
-import React from 'react';
-import { createRoot } from 'react-dom/client';
+import { render } from 'solid-js/web';
 import { App } from './App';
 import './style.css';
+import './usage-layout.css';
+import './usage-filters.css';
+import './navigation-layout.css';
 
-createRoot(document.getElementById('root')!).render(<React.StrictMode><App/></React.StrictMode>);
+render(() => <App/>, document.getElementById('root')!);

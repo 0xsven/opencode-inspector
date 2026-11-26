@@ -18,22 +18,26 @@ type Job = { identity: string; cancelled: boolean; task?: Promise<void>; child?:
 const initialFailure = 'Usage indexing failed. Use Refresh to retry.';
 const refreshFailure = 'The usage index could not be refreshed; showing the previous indexed snapshot.';
 const sourceFailure = 'The recorded usage source could not be checked; showing the previous indexed snapshot.';
+const unavailableSource = 'Recorded usage is unavailable. Check the startup database selection and local read permissions.';
+const autoCooldown = 5 * 60_000;
+const failedCooldown = 5 * 60_000;
 
-/** One configured source per app. No timer, watcher, automatic refresh or DTO cache.
- * A request checks file metadata; only initial indexing and explicit Refresh fork
- * a child. Failed jobs are latched until Refresh, preventing polling retry loops.
+/** One configured source and worker per app. Status GETs wake dirty-cache rebuilds;
+ * plain range GETs can initialize the index but never start a background refresh.
  */
 export class UsageIndex {
   private job?: Job;
-  private failure?: string;
+  private failure?: 'build' | 'accounting';
+  private autoAfter = 0;
   private last?: SourceState;
+  private checking?: Promise<SourceState | undefined>;
   private closed = false;
   private generation = 0;
-  constructor(private directory = usageCacheDirectory()) {}
+  constructor(private directory = usageCacheDirectory(), private now = () => performance.now()) {}
 
   private filename(identity: string) { return path.join(this.directory, identity + '.sqlite'); }
 
-  private async snapshot(identity: string, range: UsageRange) {
+  private async snapshot(identity: string, range?: UsageRange) {
     let db: DatabaseSync | undefined;
     let metadata: IndexMetadata | undefined;
     try {
@@ -44,7 +48,7 @@ export class UsageIndex {
       if (metadata.identity !== identity) return;
       // Header and accounting share one pinned handle, including when another
       // app process atomically replaces the index while this request reads it.
-      const result = readUsageSnapshot(db, range, metadata.indexedAt, true);
+      const result = range ? readUsageSnapshot(db, range, metadata.indexedAt, true) : undefined;
       db.exec('ROLLBACK');
       return { metadata, result };
     } catch { /* Missing, incompatible or incomplete indexes are never served. */ }
@@ -54,15 +58,20 @@ export class UsageIndex {
     if (metadata?.identity === identity) return { metadata, result: undefined };
   }
 
-  private start(source: SourceState) {
+  private start(source: SourceState, automatic = false) {
     if (this.job || this.closed) return;
-    this.failure = undefined;
+    if (!automatic) this.failure = undefined;
     const job: Job = { identity: source.identity, cancelled: false };
-    this.generation++;
     this.job = job;
-    job.task = this.build(source, job).catch(() => {
-      if (!job.cancelled && !this.closed) this.failure = source.identity;
-    }).finally(() => { if (this.job === job) this.job = undefined; });
+    const finish = (failed: boolean) => {
+      if (job.cancelled || this.closed) return;
+      this.failure = failed ? 'build' : undefined;
+      this.autoAfter = this.now() + (failed ? failedCooldown : autoCooldown);
+    };
+    job.task = this.build(source, job).then(() => finish(false), () => finish(true)).finally(() => {
+      this.generation++;
+      this.job = undefined;
+    });
   }
 
   private async build(source: SourceState, job: Job) {
@@ -112,40 +121,90 @@ export class UsageIndex {
 
   async close() { this.closed = true; await this.stopJob(); }
 
+  private async checkSource(filename: string) {
+    let source: SourceState;
+    try { source = await usageSourceState(filename); }
+    catch { return; } // Old snapshots remain readable when the source is temporarily unavailable.
+    if (this.closed) return;
+    if (this.last?.identity !== source.identity) {
+      this.last = source;
+      this.failure = undefined;
+      this.autoAfter = 0;
+      await this.stopJob();
+    }
+    return source;
+  }
+
+  private async inspect(filename: string | undefined, range?: UsageRange, refresh = false, observe = false, rebuild = false) {
+    const unavailable: UsageIndexState = { state: 'failed', indexedAt: null, sourceChanged: null, message: unavailableSource };
+    while (!this.closed && filename && path.isAbsolute(filename)) {
+      // Coalesce source discovery and identity transitions before either request
+      // can read a cache or start a worker for the replacement.
+      const source = await (this.checking ??= this.checkSource(filename).finally(() => { this.checking = undefined; }));
+      const identity = source?.identity ?? this.last?.identity;
+      if (!identity) break;
+      const observedJob = this.job;
+      let cached, generation;
+      do {
+        generation = this.generation;
+        cached = await this.snapshot(identity, range);
+        // Publication can race the filesystem lookup, even for a missing cache.
+      } while (!this.closed && generation !== this.generation && this.last?.identity === identity);
+      if (this.closed) break;
+      if (this.last?.identity !== identity) continue;
+
+      const metadata = cached?.metadata;
+      const sourceChanged = !source ? null : metadata ? metadata.changedDuringBuild || source.fingerprint !== metadata.fingerprint : true;
+      if (rebuild && source && !this.job && observedJob?.identity !== identity) {
+        this.start(source);
+      } else if (refresh && !this.job && observedJob?.identity !== identity) {
+        if (source) this.start(source); else this.failure = 'build';
+      } else if (!observe && !metadata && !this.job && !this.failure && source) {
+        this.start(source);
+      } else if (!observe && !range && source && sourceChanged && metadata && !this.job && this.failure !== 'accounting' && this.now() >= this.autoAfter) {
+        this.start(source, true);
+      }
+      const result = cached?.result;
+      const badAccounting = range && metadata && (!result || result.status === 'unavailable');
+      if (badAccounting) this.failure = 'accounting';
+      const job = this.job?.identity === identity;
+      const message = !metadata ? (job ? undefined : observe && source && !this.failure ? undefined : initialFailure)
+        : badAccounting ? initialFailure
+        : this.failure ? refreshFailure
+        : !source ? sourceFailure : undefined;
+      const index: UsageIndexState = {
+        state: !metadata ? (job ? 'indexing' : observe && source && !this.failure ? 'ready' : 'failed')
+          : badAccounting ? 'failed' : job ? 'refreshing' : message ? 'failed' : 'ready',
+        indexedAt: metadata?.indexedAt ?? null,
+        sourceChanged: !metadata && job && source ? false : sourceChanged,
+        ...(message ? { message } : {}),
+      };
+      return { index, result };
+    }
+    return { index: unavailable };
+  }
+
+  async status(filename: string | undefined): Promise<UsageIndexState> {
+    return (await this.inspect(filename)).index;
+  }
+
+  async observe(filename: string | undefined): Promise<UsageIndexState> {
+    return (await this.inspect(filename, undefined, false, true)).index;
+  }
+
+  async rebuild(filename: string | undefined): Promise<UsageIndexState> {
+    return (await this.inspect(filename, undefined, false, false, true)).index;
+  }
+
   async read(filename: string | undefined, range: UsageRange, refresh = false): Promise<IndexedUsageResponse> {
-    const unavailable = (index: UsageIndexState, message = initialFailure): IndexedUsageResponse => ({ status: 'unavailable', updatedAt: new Date().toISOString(), message, index });
-    if (this.closed || !filename || !path.isAbsolute(filename)) return unavailable({ state: 'failed', indexedAt: null, sourceChanged: null }, 'Recorded usage is unavailable. Check the startup database selection and local read permissions.');
-    let source: SourceState | undefined;
-    try { source = await usageSourceState(filename); } catch { /* Old snapshots remain readable when the source is temporarily unavailable. */ }
-    if (source && this.last?.identity !== source.identity) {
-      await this.stopJob(); this.failure = undefined; this.last = source;
+    const { index, result } = await this.inspect(filename, range, refresh);
+    if (index.state === 'indexing') {
+      return { status: 'indexing', updatedAt: new Date().toISOString(), range, index: { ...index, state: 'indexing', indexedAt: null } };
     }
-    const identity = source?.identity ?? this.last?.identity;
-    if (!identity) return unavailable({ state: 'failed', indexedAt: null, sourceChanged: null }, 'Recorded usage is unavailable. Check the startup database selection and local read permissions.');
-    const generation = this.generation, observedJob = this.job;
-    let cached = await this.snapshot(identity, range);
-    // A missing-file lookup can finish after publication. Do not accidentally
-    // launch a second initial build because that filesystem result was stale.
-    if (!cached && (generation !== this.generation || (observedJob && !this.job))) cached = await this.snapshot(identity, range);
-    const metadata = cached?.metadata;
-    if (refresh && !this.job) {
-      if (source) this.start(source); else this.failure = identity;
-    } else if (!metadata && !this.job && this.failure !== identity && source) this.start(source);
-    if (!metadata) {
-      if (this.job) return { status: 'indexing', updatedAt: new Date().toISOString(), range, index: { state: 'indexing', indexedAt: null, sourceChanged: source ? false : null } };
-      return unavailable({ state: 'failed', indexedAt: null, sourceChanged: source ? true : null });
-    }
-    const message = this.failure === identity ? refreshFailure : !source ? sourceFailure : undefined;
-    const index: UsageIndexState = {
-      state: this.job ? 'refreshing' : message ? 'failed' : 'ready', indexedAt: metadata.indexedAt,
-      sourceChanged: source ? metadata.changedDuringBuild || source.fingerprint !== metadata.fingerprint : null,
-      ...(message ? { message } : {}),
-    };
-    const result = cached?.result;
+    const { message, ...state } = index;
     if (!result || result.status === 'unavailable') {
-      this.failure = identity;
-      return unavailable({ ...index, state: 'failed', message: initialFailure });
+      return { status: 'unavailable', updatedAt: new Date().toISOString(), message: message ?? initialFailure, index: index.indexedAt === null ? state : index };
     }
-    return { ...result, updatedAt: metadata.indexedAt, ...(message ? { status: 'partial' as const, warnings: [...result.warnings, message] } : {}), index };
+    return { ...result, ...(message ? { status: 'partial' as const, warnings: [...result.warnings, message] } : {}), index };
   }
 }

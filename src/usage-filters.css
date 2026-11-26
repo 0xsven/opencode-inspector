@@ -1,0 +1,75 @@
+.usage-filters {
+  flex: 0 1 auto;
+  min-width: 0;
+  max-width: min(15rem, 100%);
+}
+
+.usage-filter-trigger {
+  display: inline-flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  width: 100%;
+  min-width: 0;
+  text-align: start;
+}
+.usage-filter-trigger-label { overflow: hidden; text-overflow: ellipsis; }
+.usage-filter-chevron {
+  flex: none;
+  width: 6px;
+  height: 6px;
+  margin-inline: 2px;
+  border: solid currentColor;
+  border-width: 0 1px 1px 0;
+  transform: translateY(-2px) rotate(45deg);
+}
+.usage-filter-panel {
+  position: fixed;
+  z-index: 7;
+  width: min(13rem, calc(100% - 16px));
+  overflow: auto;
+  overscroll-behavior: contain;
+  box-shadow: 0 6px 20px var(--shadow);
+  font-size: 13px;
+}
+.usage-filter-choices { min-width: 0; padding: 4px; }
+.usage-filter-value {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  min-height: var(--usage-option-height);
+  padding: 4px 28px 4px 10px;
+  border-radius: 6px;
+  text-align: start;
+  overflow-wrap: anywhere;
+  position: relative;
+}
+.usage-filter-panel :is(button, input):focus-visible { outline-offset: -2px; }
+.usage-filter-choices:focus-visible { outline: 2px solid var(--focus-line); outline-offset: -2px; }
+.usage-filter-search {
+  width: calc(100% - 16px);
+  min-height: 32px;
+  margin: 4px 8px;
+  padding: 4px 8px;
+  border: 1px solid var(--control-line);
+  background: var(--control-bg);
+  color: var(--control-text);
+}
+.usage-filter-value { cursor: pointer; }
+.usage-filter-value:hover { background: var(--hover); color: var(--hover-text); }
+.usage-filter-value:has(:disabled) { color: var(--panel-secondary); cursor: default; }
+.usage-filter-value input {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: 0;
+  opacity: 0;
+  clip-path: inset(50%);
+}
+.usage-filter-value:has(input:checked)::after {
+  position: absolute;
+  inset-inline-end: 10px;
+}
+.usage-filter-value:has(input:focus-visible) { outline: 2px solid var(--focus-line); outline-offset: -2px; }
+.usage-filter-panel p { margin: 0; padding: 8px; color: var(--panel-secondary); }

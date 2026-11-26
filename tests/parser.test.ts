@@ -3,11 +3,10 @@ import assert from 'node:assert/strict';
 import { mkdtemp, mkdir, writeFile, symlink, rm, realpath } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
-import { createElement } from 'react';
-import { renderToStaticMarkup } from 'react-dom/server';
 import { inspect, markdown, mergePermission, taskPermission } from '../server/parser.js';
 import { redact, redactText } from '../server/redact.js';
-import { EntryDetail } from '../src/App.js';
+import { loadComponents, renderComponent } from './solid-render.js';
+const { EntryDetail } = await loadComponents<typeof import('../src/ConfigurationViews.js')>('/src/ConfigurationViews.tsx');
 
 test('ordered wildcard task rules, shorthand, literal punctuation, and unknowns', () => {
   const permission = { task: { '*': 'deny', 'review*': 'allow', 'review-private': 'ask' } };
@@ -170,12 +169,12 @@ test('native definitions, mixed precedence, ordered subagent rules and redacted 
     assert.equal(taskPermission(build.data.effectivePermission, 'team/reviewer').action, 'ask');
     assert.equal(taskPermission(build.data.effectivePermission, 'team/other').action, 'allow');
     assert.equal(taskPermission(build.data.effectivePermission, 'other').action, 'deny');
-    const html = renderToStaticMarkup(createElement(EntryDetail, { entry: build, entries: snapshot.entries, choose() {} }));
-    assert.match(html, /href="\/models\/openai%2Ffriendly">openai\/friendly#careful/);
+    const html = renderComponent(EntryDetail, { entry: build, entries: snapshot.entries, choose() {} });
+    assert.match(html, /href="\/config\/models\/openai%2Ffriendly">openai\/friendly#careful/);
     assert.match(html, /careful · high effort/);
     assert.match(html, /sub\*: team\/reviewer/);
     assert.doesNotMatch(html, /href="[^"]*team%2Fdisabled"/);
-    const mcpHtml = renderToStaticMarkup(createElement(EntryDetail, { entry: get('MCP Servers', 'shared'), entries: snapshot.entries, choose() {} }));
+    const mcpHtml = renderComponent(EntryDetail, { entry: get('MCP Servers', 'shared'), entries: snapshot.entries, choose() {} });
     assert.match(mcpHtml, /Configured MCP timeouts/);
     assert.match(mcpHtml, /45,000/);
   } finally { await rm(root, { recursive: true, force: true }); }

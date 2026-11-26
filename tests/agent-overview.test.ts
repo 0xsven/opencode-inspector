@@ -1,11 +1,10 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { createElement } from 'react';
-import { renderToStaticMarkup } from 'react-dom/server';
 import { mkdtemp, mkdir, writeFile, rm } from 'node:fs/promises';
 import path from 'node:path';
 import os from 'node:os';
-import { EntryDetail } from '../src/App.js';
+import { loadComponents, renderComponent } from './solid-render.js';
+const { EntryDetail } = await loadComponents<typeof import('../src/ConfigurationViews.js')>('/src/ConfigurationViews.tsx');
 import { resolveAgentSettings } from '../src/agent-settings.js';
 import type { Entry } from '../src/types.js';
 import { estimatePromptSize } from '../server/prompt-size.js';
@@ -15,7 +14,7 @@ import { redactText } from '../server/redact.js';
 const agent = (data = {}): Entry => ({ id: 'build', name: 'build', category: 'Agents', description: 'A short local description.', data, sources: [], provenance: {} });
 const model: Entry = { ...agent(), category: 'Models', id: 'openai/gpt-6.1-sol', data: { limit: { context: 272000 }, variants: { careful: { reasoningEffort: 'high' } }, options: { reasoningEffort: 'low' }, providerOptions: { reasoningEffort: 'minimal' } }, modelCapacity: { provider: 'openai', model: 'gpt-6.1-sol', context: 1050000, source: { url: 'https://models.dev/api.json', checked: '2026-10-15', sha256: 'test' } } };
 function render(entry: Entry, entries: Entry[] = [entry, model]) {
-  return renderToStaticMarkup(createElement(EntryDetail, { entry, entries, choose() {} }));
+  return renderComponent(EntryDetail, { entry, entries, choose() {} });
 }
 const overview = (entry: Entry, entries?: Entry[]) => render(entry, entries).match(/<section class="[^"]*\bagent-overview\b[^"]*"[\s\S]*?<\/section>/)?.[0] || '';
 
@@ -27,10 +26,10 @@ test('agent overview presents all six requested values, configured cap and acces
   const html = overview(build, [build, model, quick, visual, denied]);
   const textContent = html.replace(/<[^>]*>/g, '');
   for (const text of ['Model', 'openai/gpt-6.1-sol', 'Reasoning variant', 'medium', 'Context limit', '272,000', 'Configured · Capped', 'A short local description.', 'Prompt length', '~1,234 tokens', 'Estimated · local prompt', 'Subagents (2)']) assert.ok(textContent.includes(text), text);
-  assert.match(html, /href="\/models\/openai%2Fgpt-6.1-sol"/);
-  assert.match(html, /href="\/agents\/quick"/);
+  assert.match(html, /href="\/config\/models\/openai%2Fgpt-6.1-sol"/);
+  assert.match(html, /href="\/config\/agents\/quick"/);
   assert.match(html, /aria-label="Visual — requires approval"/);
-  assert.doesNotMatch(html, /href="\/agents\/denied"/);
+  assert.doesNotMatch(html, /href="\/config\/agents\/denied"/);
   assert.doesNotMatch(html, /<dd>1,050,000/);
   assert.doesNotMatch(html, /Read more|Read full About/);
   assert.doesNotMatch(render(build), /<details[^>]*\bopen[\s=>]/);

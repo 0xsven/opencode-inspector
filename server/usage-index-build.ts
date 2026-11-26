@@ -4,8 +4,9 @@ import { realpath, stat } from 'node:fs/promises';
 import { readUsageSnapshot, usageIdentity, usageName, usageTokens } from './usage.js';
 import { projectToolUsage } from './usage-delegations.js';
 import { distinctAttachments, winningAttachmentOwners } from './usage-v2.js';
+import { usageKey } from './usage-sessions.js';
 
-export const usageIndexVersion = 6;
+export const usageIndexVersion = 8;
 export type SourceState = { filename: string; identity: string; fingerprint: string };
 export type IndexMetadata = { version: number; identity: string; fingerprint: string; indexedAt: string; changedDuringBuild: boolean };
 const hash = (value: string) => createHash('sha256').update(value).digest('hex');
@@ -46,7 +47,7 @@ type Row = Record<string, any>;
 const json = (column: string) => `CASE WHEN json_valid(${column}) THEN ${column} ELSE '{}' END`;
 // IDs are equality keys, not display text. Hash even malformed call IDs/objects
 // rather than retaining arbitrary values embedded in source metadata.
-const id = (value: unknown) => value === null || value === undefined ? null : hash(JSON.stringify(value));
+const id = (value: unknown) => value === null || value === undefined ? null : usageKey(value);
 const callID = (value: unknown) => hash(JSON.stringify(value ?? null));
 const kind = (value: unknown) => typeof value === 'string' && ['user', 'assistant', 'compaction', 'skill'].includes(value) ? value : 'other';
 const terminal = (value: unknown) => value === 'completed' || value === 'error' ? value : 'pending';

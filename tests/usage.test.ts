@@ -8,6 +8,7 @@ import path from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { readUsage as readLiveUsage, readUsageSnapshot, parseUsageRange, resolveUsageDatabase } from '../server/usage.js';
 import { projectUsageMetadata } from '../server/usage-index-build.js';
+import { usageKey } from '../server/usage-sessions.js';
 import { v2SkillRangeSQL } from '../server/usage-v2.js';
 import { createApp } from '../server/app.js';
 
@@ -124,6 +125,62 @@ test('model attribution follows reconciled assistant metadata, keeps provider pa
   });
 });
 
+test('weekly and monthly buckets use local calendar boundaries and count distinct sessions', async () => {
+  await fixture((db, filename) => {
+    const start = Date.parse('2026-11-01T03:59:59.999Z'), end = Date.parse('2026-12-01T05:00:00.001Z');
+    session(db, 'root', start);
+    session(db, 'other', Date.parse('2026-11-02T05:00:00.000Z'));
+    session(db, 'child', start, 'root');
+    const rows = [
+      ['root', '2026-11-01T03:59:59.999Z'], // Still October locally; inclusive start.
+      ['root', '2026-11-01T04:00:00.000Z'],
+      ['root', '2026-11-01T05:59:59.999Z'], // DST fall-back.
+      ['root', '2026-11-01T06:00:00.000Z'],
+      ['root', '2026-11-02T04:59:59.999Z'], // Still Sunday after the offset changed.
+      ['root', '2026-11-02T05:00:00.000Z'],
+      ['root', '2026-11-03T05:00:00.000Z'],
+      ['other', '2026-11-03T05:00:00.000Z'],
+      ['child', '2026-11-02T05:00:00.000Z'],
+      ['child', '2026-11-03T05:00:00.000Z'],
+      ['root', '2026-12-01T04:59:59.999Z'],
+      ['root', '2026-12-01T05:00:00.000Z'],
+      ['root', '2026-12-01T05:00:00.001Z'], // Exclusive end.
+    ];
+    rows.forEach(([id, time], i) => message(db, `msg-${i}`, id, Date.parse(time), 'build', 'assistant', 'legacy', { providerID: 'example', modelID: 'model' }));
+
+    const expected = {
+      week: [
+        { date: '2026-10-26', activeSessions: 1, newSessions: 1, subagentSessions: 0, steps: 5 },
+        { date: '2026-11-02', activeSessions: 2, newSessions: 1, subagentSessions: 1, steps: 5 },
+        { date: '2026-11-30', activeSessions: 1, newSessions: 0, subagentSessions: 0, steps: 2 },
+      ],
+      month: [
+        { date: '2026-10-01', activeSessions: 1, newSessions: 1, subagentSessions: 0, steps: 1 },
+        { date: '2026-11-01', activeSessions: 2, newSessions: 1, subagentSessions: 1, steps: 10 },
+        { date: '2026-12-01', activeSessions: 1, newSessions: 0, subagentSessions: 0, steps: 1 },
+      ],
+    };
+    for (const granularity of ['week', 'month'] as const) {
+      const result = readUsage(filename, { from: start, to: end, timezone: range.timezone, granularity });
+      assert.ok(result.status !== 'unavailable');
+      assert.deepEqual(result.activity.map(({ tokens, ...row }) => ({ ...row, tokens: tokens.total })),
+        expected[granularity].map(row => ({ ...row, tokens: row.steps * 42 })));
+      const main = expected[granularity].map(({ date, activeSessions, subagentSessions, steps }) => ({
+        date, sessions: activeSessions, steps: steps - 2 * subagentSessions, tokens: (steps - 2 * subagentSessions) * 42, role: 'main',
+      }));
+      const child = { date: expected[granularity][1].date, sessions: 1, steps: 2, tokens: 84, role: 'subagent' };
+      assert.deepEqual(result.agentActivity, [...main, child].map(row => ({ ...row, agent: 'build' })));
+      assert.deepEqual(result.modelActivity, [...main, child].map(row => ({ ...row, provider: 'example', model: 'model' })));
+      assert.deepEqual(result.summary, {
+        activeSessions: 2, newSessions: 2, subagentSessions: 1, steps: 12,
+        tokens: { input: 120, output: 240, reasoning: 36, cacheRead: 48, cacheWrite: 60, total: 504 },
+      });
+      assert.equal(result.agents[0].sessions, 3);
+      assert.equal(result.models[0].sessions, 3);
+    }
+  });
+});
+
 test('hourly model and agent timelines keep the repeated local hour distinct', async () => {
   await fixture((db, filename) => {
     const start = Date.parse('2026-11-01T04:00:00Z'), end = Date.parse('2026-11-02T05:00:00Z');
@@ -173,6 +230,259 @@ function delegationResult(filename: string, selectedRange = range) {
   }
   return result.delegations;
 }
+
+test('token and step rankings independently select their top ten with stable ties', async () => {
+  await fixture((db, filename) => {
+    const stepLeaders = Array.from({ length: 10 }, (_, i) => `step-leader-${i}`);
+    for (const id of stepLeaders) {
+      session(db, id);
+      message(db, `${id}-first`, id);
+      message(db, `${id}-second`, id);
+    }
+    session(db, 'token-leader');
+    message(db, 'token-heavy-step', 'token-leader', from + 1000, 'build', 'assistant', 'both', { tokens: { ...tokens, input: 1000 } });
+
+    const result = readUsage(filename, range);
+    assert.ok(result.status !== 'unavailable');
+    const stepIDs = stepLeaders.map(usageKey).sort();
+    const ranking = (rows: typeof result.topSessions) => rows.map(row => [row.id, row.steps, row.tokens]);
+    assert.deepEqual(ranking(result.topSessions), stepIDs.map(id => [id, 2, 84]));
+    assert.deepEqual(ranking(result.topSessionsByTokens), [
+      [usageKey('token-leader'), 1, 1032],
+      ...stepIDs.slice(0, 9).map(id => [id, 2, 84]),
+    ]);
+  });
+});
+
+test('durable descendant tokens rank under their root while zero and invalid counters still count as steps', async () => {
+  await fixture((db, filename) => {
+    session(db, 'root');
+    session(db, 'child', from - 1000, 'root');
+    session(db, 'steps-only');
+    message(db, 'zero-step', 'steps-only', from + 1000, 'build', 'assistant', 'both', {
+      tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 }, total: 9999 },
+    });
+    message(db, 'invalid-step', 'steps-only', from + 1000, 'build', 'assistant', 'both', {
+      tokens: { ...tokens, input: -1 },
+    });
+    db.prepare('INSERT INTO event VALUES(?,?,?,?,?)').run('durable', 'child', 'session.usage.recorded.1', from + 2000, JSON.stringify({ source: 'title', tokens }));
+
+    const result = readUsage(filename, range);
+    assert.ok(result.status !== 'unavailable');
+    assert.deepEqual(result.topSessions, [
+      { id: usageKey('steps-only'), title: null, project: null, steps: 2, tokens: 0 },
+    ]);
+    assert.deepEqual(result.topSessionsByTokens, [
+      { id: usageKey('root'), title: null, project: null, steps: 0, tokens: 42 },
+    ]);
+    assert.equal(result.summary.tokens.total, 42);
+  });
+});
+
+test('project scopes reconcile moved sessions, roll up verified descendants, and preserve all-project picker totals', async () => {
+  await fixture((db, filename) => {
+    db.exec(`CREATE TABLE project(id TEXT PRIMARY KEY, name TEXT, worktree TEXT);
+      INSERT INTO project VALUES ('PROJ_ALPHA', 'Alpha', '/Users/PRIVATE/alpha'),
+        ('PROJ_BETA', NULL, '/Users/PRIVATE/beta/'), ('global', 'Do not use', '/');
+      ALTER TABLE session ADD COLUMN project_id TEXT;
+      ALTER TABLE session ADD COLUMN title TEXT;
+      ALTER TABLE session ADD COLUMN time_updated INTEGER;
+      ALTER TABLE session_v2 ADD COLUMN project_id TEXT;
+      ALTER TABLE session_v2 ADD COLUMN title TEXT;
+      ALTER TABLE session_v2 ADD COLUMN time_updated INTEGER;`);
+    const addSession = (id: string, project: string | null, title: string, parent: string | null = null, fork: string | null = null, created = from - 1000) => {
+      db.prepare('INSERT INTO session VALUES(?,?,?,?,?,?)').run(id, parent, created, project, title, from);
+      db.prepare('INSERT INTO session_v2 VALUES(?,?,?,?,?,?,?)').run(id, parent, created, fork, project, title, from);
+    };
+    addSession('root-moved', 'PROJ_ALPHA', 'Moved sk-faketitle12345');
+    // Worktree.Event.Resolved changes V2 project_id without touching time_updated.
+    db.prepare('UPDATE session_v2 SET project_id=?,title=? WHERE id=?')
+      .run('PROJ_BETA', 'Tie loses', 'root-moved');
+    addSession('child', 'PROJ_ALPHA', 'Child', 'root-moved');
+    addSession('grandchild', null, 'Grandchild', 'child');
+    // Parent records and descendants may exist in only one format each.
+    db.exec("DELETE FROM session_v2 WHERE id='grandchild'; DELETE FROM session WHERE id='child'");
+    addSession('alpha-root', 'PROJ_ALPHA', 'Alpha task');
+    db.exec("UPDATE session_v2 SET title='Tie loses' WHERE id='alpha-root'");
+    addSession('alpha-user', 'PROJ_ALPHA', 'User-only');
+    addSession('fork', 'PROJ_ALPHA', 'Independent fork', null, 'root-moved', from + 900);
+    addSession('unattributed-root', 'global', '/Users/PRIVATE/title');
+    addSession('orphan', 'MISSING_PROJECT', 'Orphan', 'missing-session');
+    addSession('cycle', 'PROJ_ALPHA', 'Cycle', 'cycle');
+    addSession('ambiguous', 'PROJ_ALPHA', 'Conflict', 'root-moved');
+    db.exec("UPDATE session_v2 SET parent_id='alpha-root' WHERE id='ambiguous'");
+    message(db, 'migrated', 'root-moved');
+    message(db, 'updated', 'root-moved', from + 1000, 'winner');
+    db.prepare('UPDATE session_message SET time_updated=? WHERE id=?').run(from + 3000, 'updated');
+    message(db, 'child-step', 'child', from + 1000, 'review', 'assistant', 'v2', {
+      tokens: null,
+      content: [{ type: 'tool', id: 'load', name: 'skill', state: { status: 'completed', input: { name: 'v2-skill' } }, time: { completed: from + 2000 } }],
+    });
+    message(db, 'grandchild-step', 'grandchild', from + 1001, 'legacy', 'assistant', 'legacy');
+    message(db, 'activation', 'child', from + 1000, null, 'skill', 'v2', { name: 'activated' });
+    message(db, 'a1', 'alpha-root', from + 1000, 'alpha', 'assistant', 'legacy');
+    message(db, 'a2', 'alpha-root', from + 1000, 'alpha', 'assistant', 'legacy');
+    message(db, 'user-only', 'alpha-user', from + 1000, null, 'user');
+    message(db, 'copy', 'fork', from + 800);
+    message(db, 'fork-step', 'fork');
+    message(db, 'global-step', 'unattributed-root');
+    message(db, 'orphan-step', 'orphan');
+    message(db, 'cycle-step', 'cycle');
+    message(db, 'conflict-step', 'ambiguous');
+    message(db, 'exclusive-end', 'root-moved', to);
+    db.prepare('INSERT INTO event VALUES(?,?,?,?,?)').run('durable', 'child', 'session.usage.recorded.1', from + 4000, JSON.stringify({ source: 'title', tokens }));
+    skillPart(db, 'legacy-skill', 'migrated', 'root-moved', 'completed', 'legacy-skill');
+    skillPart(db, 'alpha-skill', 'a1', 'alpha-root', 'error', 'legacy-skill');
+    taskPart(db, 'moved-attempt', 'migrated', 'root-moved', { child: 'child' });
+    taskPart(db, 'alpha-attempt', 'a1', 'alpha-root', { callee: 'alpha-agent' });
+    taskPart(db, 'unlocated', 'orphan-step', 'orphan', { created: 'invalid' });
+
+    const all = readUsage(filename, range);
+    assert.ok(all.status !== 'unavailable');
+    const [alpha, beta, unknown] = all.projects;
+    assert.match(alpha.id, /^[0-9a-f]{64}$/); assert.match(beta.id, /^[0-9a-f]{64}$/);
+    assert.deepEqual(all.projects, [
+      { id: alpha.id, name: 'Alpha', sessions: 3, steps: 5, tokens: 210 },
+      { id: beta.id, name: 'beta', sessions: 1, steps: 4, tokens: 168 },
+      { id: 'unattributed', name: 'Unattributed', sessions: 1, steps: 2, tokens: 84 },
+    ]);
+    assert.equal(all.summary.steps, 11);
+    assert.equal(all.summary.activeSessions, 5);
+    assert.equal(all.topSessions.length, 4);
+    assert.deepEqual(all.topSessions.slice(0, 2).map(({ id, ...row }) => {
+      assert.match(id, /^[0-9a-f]{64}$/); return row;
+    }), [
+      { title: 'Moved [REDACTED]', project: 'beta', steps: 4, tokens: 168 },
+      { title: 'Alpha task', project: 'Alpha', steps: 2, tokens: 84 },
+    ]);
+    assert.deepEqual(all.topSessionsByTokens, all.topSessions, 'unverified ancestry contributes to totals but not either rank');
+
+    const scoped = readUsage(filename, { ...range, project: beta.id });
+    assert.ok(scoped.status !== 'unavailable');
+    assert.deepEqual(scoped.projects, all.projects);
+    assert.deepEqual(scoped.topSessions, all.topSessions.slice(0, 1));
+    assert.deepEqual(scoped.topSessionsByTokens, all.topSessionsByTokens.slice(0, 1));
+    assert.deepEqual([scoped.summary.activeSessions, scoped.summary.subagentSessions, scoped.summary.newSessions, scoped.summary.steps, scoped.summary.tokens.total], [1, 2, 0, 4, 168]);
+    for (const rows of [scoped.activity, scoped.agents, scoped.models, scoped.agentActivity, scoped.modelActivity]) {
+      assert.equal(rows.reduce((sum, row) => sum + row.steps, 0), 4);
+    }
+    assert.deepEqual(scoped.skills.map(row => row.name), ['activated', 'legacy-skill', 'v2-skill']);
+    assert.equal(scoped.delegations.totalAttempts, 1);
+    assert.equal(scoped.delegations.unlocatedAttempts, 0);
+    assert.ok(!scoped.delegations.nodes.some(node => node.agent === 'alpha-agent'));
+
+    const childOnly = readUsage(filename, { ...range, from: from + 1001, to: from + 1002, project: beta.id });
+    assert.ok(childOnly.status !== 'unavailable');
+    assert.equal(childOnly.summary.activeSessions, 0);
+    assert.deepEqual(childOnly.topSessions, [{ ...all.topSessions[0], steps: 1, tokens: 42 }]);
+    assert.deepEqual(childOnly.topSessionsByTokens, childOnly.topSessions);
+
+    const alphaScope = readUsage(filename, { ...range, project: alpha.id });
+    assert.ok(alphaScope.status !== 'unavailable');
+    assert.equal(alphaScope.summary.newSessions, 1);
+    assert.deepEqual(alphaScope.topSessions.map(row => row.title), ['Alpha task', 'Independent fork']);
+    assert.deepEqual(alphaScope.skills, [{ name: 'legacy-skill', sessions: 1, loads: 0, failedLoads: 1 }]);
+
+    const unassigned = readUsage(filename, { ...range, project: unknown.id });
+    assert.ok(unassigned.status !== 'unavailable');
+    assert.equal(unassigned.summary.steps, 2);
+    assert.deepEqual(unassigned.topSessions.map(({ id: _id, ...row }) => row), [{ title: null, project: null, steps: 1, tokens: 42 }]);
+    assert.deepEqual(unassigned.topSessionsByTokens, unassigned.topSessions);
+    assert.equal(unassigned.delegations.totalAttempts, 0);
+    assert.equal(unassigned.delegations.unlocatedAttempts, 1);
+
+    const combined = readUsage(filename, { ...range, projects: [alpha.id, beta.id].sort() });
+    assert.ok(combined.status !== 'unavailable');
+    assert.deepEqual(combined.projects, all.projects);
+    assert.deepEqual(combined.topSessions, all.topSessions.filter(row => row.project !== null));
+    assert.deepEqual(combined.topSessionsByTokens, all.topSessionsByTokens.filter(row => row.project !== null));
+    assert.deepEqual([combined.summary.activeSessions, combined.summary.subagentSessions, combined.summary.newSessions, combined.summary.steps, combined.summary.tokens.total], [4, 4, 1, 9, 378]);
+    for (const rows of [combined.activity, combined.agents, combined.models, combined.agentActivity, combined.modelActivity]) {
+      assert.equal(rows.reduce((sum, row) => sum + row.steps, 0), 9);
+    }
+    assert.deepEqual(combined.models.map(row => [row.sessions, row.steps]), [[7, 9]], 'shared model rows merge across selected owners');
+    assert.deepEqual(combined.skills, [
+      { name: 'activated', sessions: 1, loads: 1, failedLoads: 0 },
+      { name: 'legacy-skill', sessions: 2, loads: 1, failedLoads: 1 },
+      { name: 'v2-skill', sessions: 1, loads: 1, failedLoads: 0 },
+    ]);
+    assert.equal(combined.delegations.totalAttempts, 2);
+    assert.equal(combined.delegations.unlocatedAttempts, 0);
+    assert.ok(combined.delegations.nodes.some(node => node.agent === 'alpha-agent'));
+    assert.doesNotMatch(combined.delegations.warnings.join(' '), /lack a valid creation timestamp/);
+
+    const includingUnattributed = readUsage(filename, { ...range, projects: [beta.id, unknown.id].sort() });
+    assert.ok(includingUnattributed.status !== 'unavailable');
+    assert.deepEqual(includingUnattributed.projects, all.projects);
+    assert.equal(includingUnattributed.summary.steps, 6);
+    assert.equal(includingUnattributed.summary.tokens.total, 252);
+    assert.deepEqual(includingUnattributed.topSessions, [...scoped.topSessions, ...unassigned.topSessions]);
+    assert.deepEqual(includingUnattributed.topSessionsByTokens, [...scoped.topSessionsByTokens, ...unassigned.topSessionsByTokens]);
+    assert.deepEqual(includingUnattributed.skills, scoped.skills);
+    assert.equal(includingUnattributed.delegations.totalAttempts, 1);
+    assert.equal(includingUnattributed.delegations.unlocatedAttempts, 1);
+    assert.deepEqual(includingUnattributed.delegations.nodes, scoped.delegations.nodes);
+    assert.doesNotMatch(JSON.stringify([all, scoped, unassigned, combined, includingUnattributed]), /PROJ_|MISSING_PROJECT|PRIVATE|sk-faketitle|root-moved|Tie loses/);
+
+    for (let i = 0; i < 8; i++) {
+      addSession(`extra-${i}`, 'PROJ_ALPHA', `Extra session ${i}`);
+      message(db, `extra-step-${i}`, `extra-${i}`);
+    }
+    const expanded = readUsage(filename, range);
+    assert.ok(expanded.status !== 'unavailable');
+    assert.equal(expanded.topSessions.length, 10);
+    assert.deepEqual(expanded.topSessions.slice(0, 2), all.topSessions.slice(0, 2));
+
+    db.exec('ALTER TABLE session_v2 DROP COLUMN project_id');
+    const missingV2ProjectField = readUsage(filename, range);
+    assert.ok(missingV2ProjectField.status !== 'unavailable');
+    assert.deepEqual(missingV2ProjectField.topSessions[0], { ...all.topSessions[0], project: 'Alpha' });
+  });
+});
+
+test('record-specific V2 skill and delegation diagnostics only affect their owning scope', async () => {
+  await fixture((db, filename) => {
+    db.exec(`CREATE TABLE project(id TEXT PRIMARY KEY, name TEXT);
+      INSERT INTO project VALUES ('clean', 'Clean'), ('dirty', 'Dirty');
+      ALTER TABLE session ADD COLUMN project_id TEXT;
+      ALTER TABLE session_v2 ADD COLUMN project_id TEXT;`);
+    db.prepare('INSERT INTO session VALUES(?,?,?,?)').run('clean-owner', null, from - 1000, 'clean');
+    db.prepare('INSERT INTO session_v2 VALUES(?,?,?,?,?)').run('dirty-owner', null, from - 1000, null, 'dirty');
+    message(db, 'clean-message', 'clean-owner', from + 1000, 'build', 'assistant', 'legacy');
+    const load = { type: 'tool', id: 'attempt', name: 'skill', state: { status: 'completed', input: { name: 'notes' } }, time: { completed: from + 2000 } };
+    message(db, 'dirty-duplicates', 'dirty-owner', from + 1000, 'build', 'assistant', 'v2', { content: [load, load] });
+    message(db, 'dirty-shape', 'dirty-owner', from - 500, 'build', 'assistant', 'v2', { content: {} });
+    message(db, 'dirty-future', 'dirty-owner', to + 1000, 'build', 'assistant', 'v2', { content: [{ ...load, time: {} }] });
+    const all = readUsage(filename, range);
+    assert.ok(all.status === 'partial');
+    const clean = all.projects.find(row => row.name === 'Clean')!, dirty = all.projects.find(row => row.name === 'Dirty')!;
+    assert.match(all.warnings.join(' '), /Duplicate V2 skill/);
+    assert.doesNotMatch(all.warnings.join(' '), /lack a completion timestamp/);
+    assert.match(all.delegations.warnings.join(' '), /unsupported shape/, 'snapshot diagnostic includes earlier attempts');
+    const cleanRange = { ...range, project: clean.id };
+    const cleanScope = readUsage(filename, cleanRange);
+    assert.ok(cleanScope.status === 'available');
+    assert.deepEqual(cleanScope.warnings, []);
+    assert.deepEqual(cleanScope.delegations.warnings, []);
+    const cleanUnion = readUsage(filename, { ...range, projects: [clean.id, 'unattributed'] });
+    assert.ok(cleanUnion.status === 'available');
+    assert.deepEqual(cleanUnion.warnings, []);
+    assert.deepEqual(cleanUnion.delegations.warnings, []);
+    const dirtyScope = readUsage(filename, { ...range, project: dirty.id, to: to + 2000 });
+    assert.ok(dirtyScope.status === 'partial');
+    assert.match(dirtyScope.warnings.join(' '), /Duplicate V2 skill/);
+    assert.match(dirtyScope.warnings.join(' '), /lack a completion timestamp/);
+    assert.match(dirtyScope.delegations.warnings.join(' '), /unsupported shape/);
+    const dirtyUnion = readUsage(filename, { ...range, to: to + 2000, projects: [clean.id, dirty.id].sort() });
+    assert.ok(dirtyUnion.status === 'partial');
+    assert.deepEqual(dirtyUnion.warnings, dirtyScope.warnings);
+    assert.deepEqual(dirtyUnion.delegations.warnings, dirtyScope.delegations.warnings);
+    db.exec('DROP TABLE part');
+    const structuralWarning = readUsage(filename, cleanRange);
+    assert.ok(structuralWarning.status === 'partial');
+    assert.match(structuralWarning.delegations.warnings.join(' '), /Legacy delegation tool history is unavailable/);
+  });
+});
 
 test('delegations reconcile messages before extraction across legacy, migrated task and native V2; reject forks and non-assistant owners', async () => {
   await fixture((db, filename) => {
@@ -578,6 +888,9 @@ test('generate-only durable usage counts at event creation under Unknown with no
     assert.equal(result.status, 'available');
     const recorded = { input: 10, output: 20, reasoning: 3, cacheRead: 4, cacheWrite: 5, total: 42 };
     assert.deepEqual(result.summary, { activeSessions: 0, newSessions: 0, subagentSessions: 0, steps: 0, tokens: recorded });
+    assert.deepEqual(result.topSessionsByTokens, [
+      { id: usageKey('root'), title: null, project: null, steps: 0, tokens: 42 },
+    ]);
     assert.deepEqual(result.activity, [{ date: '2026-10-01', ...result.summary }]);
     assert.deepEqual(result.agents, [{ name: 'Unknown', sessions: 1, steps: 0, tokens: recorded }]);
     assert.deepEqual(result.models, [{ provider: null, model: null, sessions: 1, steps: 0, tokens: recorded }]);
@@ -754,7 +1067,22 @@ test('range validation and HTTP privacy guards reject invalid and path-selecting
   assert.deepEqual(parseUsageRange({ from: String(from), to: String(to), timezone: range.timezone }), range);
   assert.equal(parseUsageRange({ from: String(from), to: String(to), timezone: range.timezone, granularity: 'hour' }), undefined);
   assert.equal(parseUsageRange({ from: String(from), to: String(to), timezone: range.timezone, granularity: 'minute' }), undefined);
-  await fixture(async (_db, filename) => {
+  for (const [granularity, limit] of [
+    ['hour', 26 * 3_600_000], ['day', 32 * 86_400_000], ['week', 100 * 86_400_000], ['month', Date.UTC(2070, 0, 1)],
+  ] as const) {
+    assert.deepEqual(parseUsageRange({ from: '0', to: String(limit), timezone: 'UTC', granularity }),
+      { from: 0, to: limit, timezone: 'UTC', granularity });
+    assert.equal(parseUsageRange({ from: '0', to: String(limit + 1), timezone: 'UTC', granularity }), undefined);
+  }
+  await fixture(async (db, filename) => {
+    for (const id of ['first', 'second', 'excluded']) {
+      session(db, id);
+      message(db, `${id}-step`, id);
+    }
+    db.exec(`CREATE TABLE project(id TEXT PRIMARY KEY, name TEXT);
+      INSERT INTO project VALUES ('first-project', 'First'), ('second-project', 'Second');
+      ALTER TABLE session ADD COLUMN project_id TEXT;
+      UPDATE session SET project_id=id || '-project' WHERE id IN ('first', 'second');`);
     const app = createApp({ root: path.resolve('examples/demo'), usageDatabase: filename, usageCacheDirectory: path.join(path.dirname(filename), 'cache') });
     const server = app.listen(0, '127.0.0.1');
     await new Promise<void>(resolve => server.once('listening', resolve));
@@ -765,29 +1093,77 @@ test('range validation and HTTP privacy guards reject invalid and path-selecting
     });
     try {
       const url = `/API/usage?from=${from}&to=${to}&timezone=UTC`;
-      assert.equal((await get(url)).status, 200);
+      const baseRange = { from, to, timezone: 'UTC' };
+      const [first, second] = [usageKey('first-project'), usageKey('second-project')].sort();
+      const unionSuffix = `&project=${second}&project=${first}`;
+      const unionRange = { ...baseRange, projects: [first, second] };
+      const starting = await get(url + unionSuffix);
+      assert.equal(starting.status, 200);
+      assert.equal(JSON.parse(starting.body).index.state, 'indexing');
+      assert.deepEqual(JSON.parse(starting.body).range, unionRange);
       assert.equal((await get(url + '&db=/etc/passwd')).status, 400);
       for (const suffix of ['&refresh=0', '&refresh=true', '&refresh=1&refresh=1', '&refresh[]=1']) assert.equal((await get(url + suffix)).status, 400);
+      for (const project of ['', '%2Fetc%2Fpasswd', 'A'.repeat(64), 'a'.repeat(63), 'a'.repeat(64) + '%0A']) {
+        assert.equal((await get(url + '&project=' + project)).status, 400);
+        assert.equal((await get(url + '&project=unattributed&project=' + project)).status, 400);
+      }
+      for (const suffix of ['&project[]=unattributed', '&projects=unattributed', '&project=unattributed'.repeat(51),
+        '&project=unattributed'.repeat(50) + '&'.repeat(1000) + 'project=unattributed']) {
+        assert.equal((await get(url + suffix)).status, 400);
+      }
       assert.equal((await get('/api/usage?from=invalid')).status, 400);
       assert.equal((await get(url, { origin: 'http://evil.test' })).status, 403);
       assert.equal((await get(url, { host: 'evil.test' })).status, 403);
       assert.equal((await get(url, { 'sec-fetch-site': 'cross-site' })).status, 403);
       for (const method of ['POST', 'HEAD']) assert.equal((await get(url, {}, method)).status, 405);
-      const settled = async () => {
+      const settled = async (suffix = '') => {
         for (let i = 0; i < 400; i++) {
-          const response = await get(url), dto = JSON.parse(response.body);
+          const response = await get(url + suffix), dto = JSON.parse(response.body);
           if (!['indexing', 'refreshing'].includes(dto.index.state)) return response;
           await delay(20);
         }
         throw new Error('Index did not settle');
       };
-      assert.equal(JSON.parse((await settled()).body).index.state, 'ready');
-      _db.exec('DROP TABLE session; DROP TABLE session_v2');
+      const unscoped = JSON.parse((await settled()).body);
+      assert.equal(unscoped.index.state, 'ready');
+      assert.equal(unscoped.summary.steps, 3);
+      assert.deepEqual(unscoped.topSessionsByTokens, unscoped.topSessions);
+      assert.deepEqual(unscoped.topSessions.map((row: { tokens: number }) => row.tokens), [42, 42, 42]);
+      assert.deepEqual(unscoped.projects.map((project: { name: string }) => project.name), ['First', 'Second', 'Unattributed']);
+      const all = await get(`/api/usage?from=0&to=${to}&timezone=UTC&granularity=month`);
+      assert.equal(all.status, 200);
+      const parsedAll = JSON.parse(all.body);
+      assert.deepEqual(parsedAll.range, { from: 0, to, timezone: 'UTC', granularity: 'month' });
+      assert.equal(parsedAll.index.state, 'ready', 'changing granularity does not rebuild the index');
+      for (const project of ['unattributed', first]) {
+        const scoped = await get(url + '&project=' + project);
+        assert.equal(scoped.status, 200);
+        assert.deepEqual(JSON.parse(scoped.body).range, { ...baseRange, project });
+      }
+      const repeated = await get(url + '&project=unattributed'.repeat(50));
+      assert.equal(repeated.status, 200);
+      assert.deepEqual(JSON.parse(repeated.body).range, { ...baseRange, project: 'unattributed' });
+      const union = await get(url + unionSuffix);
+      assert.equal(union.status, 200);
+      const selected = JSON.parse(union.body);
+      assert.deepEqual(selected.range, unionRange);
+      assert.equal(selected.index.state, 'ready', 'changing project scope does not rebuild the index');
+      assert.equal(selected.index.indexedAt, unscoped.index.indexedAt);
+      assert.equal(selected.summary.steps, 2);
+      assert.equal(selected.summary.tokens.total, 84);
+      assert.deepEqual(selected.projects, unscoped.projects);
+      assert.deepEqual(await get(url + `&project=${first}&project=${second}&project=${first}`), union);
+      db.exec('DROP TABLE session; DROP TABLE session_v2');
       assert.equal(JSON.parse((await get(url)).body).index.sourceChanged, true);
-      await get(url + '&refresh=1');
-      const response = await settled();
-      assert.equal(JSON.parse(response.body).status, 'partial');
-      assert.equal(JSON.parse(response.body).index.state, 'failed');
+      await get(url + unionSuffix + '&refresh=1');
+      const response = await settled(unionSuffix);
+      const retained = JSON.parse(response.body);
+      assert.equal(retained.status, 'partial');
+      assert.equal(retained.index.state, 'failed');
+      assert.equal(retained.index.indexedAt, selected.index.indexedAt);
+      assert.deepEqual(retained.range, unionRange);
+      assert.deepEqual(retained.summary, selected.summary);
+      assert.deepEqual(retained.projects, unscoped.projects);
       assert.doesNotMatch(response.body, /usage\.db|SELECT|sqlite|\/Users\//);
     } finally {
       await new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve()));

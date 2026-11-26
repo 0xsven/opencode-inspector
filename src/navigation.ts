@@ -1,47 +1,50 @@
 import type { Category } from './types';
 
 export type UsagePage = 'overview' | 'agents' | 'models' | 'skills';
-export type SettingsPage = 'general' | 'theme';
-export type NavigationSection = 'Usage' | 'Config' | 'Settings';
-export interface Route { category: Category | null; id: string | null; page?: 'settings' | 'usage'; subpage?: UsagePage | SettingsPage }
+export type SettingsPage = 'general' | 'theme' | 'indexing';
+export interface Route { category: Category | null; id: string | null; page?: 'settings' | 'usage' | 'config'; subpage?: UsagePage | SettingsPage }
 export const categorySlugs: Record<Category, string> = {
   Agents: 'agents', Skills: 'skills', Commands: 'commands', Models: 'models',
   'MCP Servers': 'mcp-servers', Plugins: 'plugins', Instructions: 'instructions',
 };
 export const sectionKeys = ['about', 'model-settings', 'subagents', 'task-rules', 'prompt', 'instructions', 'permissions', 'agent-rules', 'context-limits', 'sources', 'provenance', 'raw-configuration'] as const;
 export interface LocationView { route: Route; invalid: boolean; open: string[]; raw: boolean }
-export const home: Route = { category: null, id: null };
+export const configRoute: Route = { category: null, id: null, page: 'config' };
 export const settingsRoute: Route = { category: null, id: null, page: 'settings', subpage: 'general' };
 export const usageRoute: Route = { category: null, id: null, page: 'usage', subpage: 'overview' };
-export function routeSection(route: Route): NavigationSection | null {
-  return route.page === 'usage' ? 'Usage' : route.page === 'settings' ? 'Settings' : route.category ? 'Config' : null;
-}
-export interface ListState { query: string; scroll: number }
+export const home = usageRoute;
+export interface ListState { query: string; scroll: number; focusedId?: string }
 const emptyList: ListState = { query: '', scroll: 0 };
 
 export function routePath(route: Route): string {
-  if (route.page === 'settings' || route.page === 'usage') return `/${route.page}/${route.subpage || (route.page === 'usage' ? 'overview' : 'general')}`;
+  if (route.page === 'config') return '/config';
+  if (route.page === 'settings') return route.subpage === 'theme' || route.subpage === 'indexing' ? `/settings/${route.subpage}` : '/settings';
+  if (route.page === 'usage') return route.subpage && route.subpage !== 'overview' ? `/usage/${route.subpage}` : '/usage';
+  // Browsers normalize dot-only segments even when encoded; escape leading tildes too.
   // Browsers normalize even percent-encoded dot-only path segments. Reserve a
   // tilde escape for those IDs (and escape literal leading tildes as well).
   const escaped = route.id === '.' || route.id === '..' || route.id?.startsWith('~') ? `~${route.id}` : route.id;
   const id = escaped !== null ? encodeURIComponent(escaped) : null;
-  return route.category ? `/${categorySlugs[route.category]}${id !== null ? `/${id}` : ''}` : '/';
+  return route.category ? `/config/${categorySlugs[route.category]}${id !== null ? `/${id}` : ''}` : '/';
 }
 
 // Decode only once. IDs are snapshot lookup keys, never filesystem paths.
 export function parseLocation(pathname: string, search = ''): LocationView {
   let route = home;
   let invalid = false;
-  if (pathname === '/settings' || pathname === '/settings/general') route = settingsRoute;
+  if (pathname === '/config') route = configRoute;
+  else if (pathname === '/settings' || pathname === '/settings/general') route = settingsRoute;
   else if (pathname === '/settings/theme') route = { ...settingsRoute, subpage: 'theme' };
+  else if (pathname === '/settings/indexing') route = { ...settingsRoute, subpage: 'indexing' };
   else if (pathname === '/usage' || pathname === '/usage/overview') route = usageRoute;
   else if (pathname === '/usage/agents' || pathname === '/usage/models' || pathname === '/usage/skills') route = { ...usageRoute, subpage: pathname.split('/')[2] as UsagePage };
   else if (pathname !== '/') {
-    const match = /^\/([^/]+)(?:\/(.+))?$/.exec(pathname);
+    const match = /^\/(?:config\/)?([^/]+)(?:\/(.+))?$/.exec(pathname);
     const category = Object.keys(categorySlugs).find(key => categorySlugs[key as Category] === match?.[1]) as Category | undefined;
     if (!match || !category) invalid = true;
     else {
       try {
+        // IDs are decoded once for snapshot lookup, never as filesystem paths.
         const decoded = match[2] === undefined ? null : decodeURIComponent(match[2]);
         route = { category, id: decoded?.startsWith('~') ? decoded.slice(1) : decoded };
       }
@@ -70,9 +73,13 @@ export function createBrowserNavigation(browser: Browser) {
   const list = (): ListState => lists.get(depth()) || browser.history.state?.opencodeInspectorList || emptyList;
   return {
     read,
+    position: depth,
     list,
     saveList: (value: ListState) => { lists.set(depth(), value); },
-    canBack: () => depth() > 0 || browser.location.pathname !== '/',
+    canBack: () => {
+      const current = read();
+      return depth() > 0 || current.invalid || routePath(current.route) !== routePath(home);
+    },
     subscribe(listener: () => void) {
       if (!listeners.size) {
         browser.history.replaceState(state(depth()), '', browser.location.href);

@@ -125,6 +125,7 @@ export function appearance(palette: ThemePalette | undefined, mode: ColorMode): 
   const line = mix(colors.borderSubtle, colors.background, .55);
   const values: Record<string, string> = {
     background: colors.background, chrome: gui ? '#10111a' : colors.background, 'refresh-idle-opacity': String(Number(refreshIdleOpacity.toFixed(2))),
+    'chrome-line': mode === 'dark' ? '#ffffff17' : '#0000001a',
     text, secondary: readable(colors.textMuted, colors.background),
     line, 'focus-line': readable(colors.borderActive, colors.background, 3), accent: readable(colors.primary, colors.background), selected,
     'selected-text': readable(text, selected), 'selected-secondary': readable(colors.textMuted, selected),

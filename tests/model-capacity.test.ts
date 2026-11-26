@@ -3,12 +3,11 @@ import assert from 'node:assert/strict';
 import { mkdtemp, writeFile, rm } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
-import { createElement } from 'react';
-import { renderToStaticMarkup } from 'react-dom/server';
 import { compareContext, formatLimit } from '../src/model-capacity.js';
 import { lookupModelCapacity } from '../server/model-capacities.js';
 import { inspect } from '../server/parser.js';
-import { EntryDetail } from '../src/App.js';
+import { loadComponents, renderComponent } from './solid-render.js';
+const { EntryDetail } = await loadComponents<typeof import('../src/ConfigurationViews.js')>('/src/ConfigurationViews.tsx');
 
 test('context comparison requires positive numeric limits on both sides', () => {
   assert.equal(compareContext(272000, 1050000), 'lower');
@@ -71,7 +70,7 @@ test('parser separates allowlisted capacity from raw fields; Build and Models SS
     assert.equal(model.modelCapacity?.context, 1050000);
     assert.deepEqual(Object.keys(model.modelCapacity!).sort(), ['context', 'model', 'provider', 'source']);
     for (const id of ['openai/unlisted', 'custom/gpt-6-sol']) assert.equal(snapshot.entries.find(e => e.id === id)?.modelCapacity, undefined);
-    const render = (entry: typeof model) => renderToStaticMarkup(createElement(EntryDetail, { entry, entries: snapshot.entries, choose() {} }));
+    const render = (entry: typeof model) => renderComponent(EntryDetail, { entry, entries: snapshot.entries, choose() {} });
     for (const entry of [snapshot.entries.find(e => e.id === 'build')!, model]) {
       const html = render(entry);
       assert.match(html, /Configured context<\/th><td role="cell" data-label="Value"><code>272,000<\/code>/);

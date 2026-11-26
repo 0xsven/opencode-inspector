@@ -49,6 +49,11 @@ function ready(dto: IndexedUsageResponse) {
 
 test('initial build coalesces, stores only private metadata, persists across restart and leaves live WAL untouched', async () => {
   await fixture(async (filename, directory, db) => {
+    db.exec(`CREATE TABLE project(id TEXT PRIMARY KEY, name TEXT, worktree TEXT);
+      INSERT INTO project VALUES ('PRIVATE PROJECT', '/Users/PRIVATE/name', '/Users/PRIVATE/Visible');
+      ALTER TABLE session ADD COLUMN project_id TEXT;
+      ALTER TABLE session ADD COLUMN title TEXT;
+      UPDATE session SET project_id='PRIVATE PROJECT', title='[redacted:session-title:PRIVATE SESSION ID]';`);
     db.exec('PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0');
     db.prepare("UPDATE message SET time_updated=time_updated+1 WHERE id='PRIVATE MESSAGE ID'").run();
     const before = await stat(filename), walBefore = await stat(filename + '-wal');
@@ -61,12 +66,17 @@ test('initial build coalesces, stores only private metadata, persists across res
       assert.equal(first.index.state, 'ready'); assert.equal(first.summary.tokens.total, 15);
       assert.deepEqual(first.models.map(({ provider, model, steps, sessions }) => ({ provider, model, steps, sessions })), [{ provider: 'openai', model: 'recorded-model', steps: 1, sessions: 1 }]);
       assert.equal(first.skills[0].loads, 1); assert.equal(first.updatedAt, first.index.indexedAt);
+      const [project] = first.projects;
+      assert.match(project.id, /^[0-9a-f]{64}$/);
+      assert.deepEqual(project, { id: project.id, name: 'Visible', sessions: 1, steps: 1, tokens: 15 });
+      assert.equal(first.topSessions[0].title, null);
       const files = await readdir(cache);
       assert.equal(files.length, 1); assert.match(files[0], /^[a-f0-9]{64}\.sqlite$/);
       assert.equal((await stat(cache)).mode & 0o777, 0o700);
       assert.equal((await stat(path.join(cache, files[0]))).mode & 0o777, 0o600);
       const bytes = await readFile(path.join(cache, files[0]));
-      assert.doesNotMatch(bytes.toString('utf8'), /PRIVATE|sk-private|source\.db|\/Users\//);
+      assert.doesNotMatch(bytes.toString('utf8'), /PRIVATE|sk-private|source\.db|\/Users\/|redacted:session-title/);
+      assert.doesNotMatch(JSON.stringify(first), /PRIVATE SESSION ID|redacted:session-title/);
       const cached = new DatabaseSync(path.join(cache, files[0]), { readOnly: true });
       try {
         cached.exec('PRAGMA query_only=ON');
@@ -80,6 +90,7 @@ test('initial build coalesces, stores only private metadata, persists across res
         assert.equal(persisted.index.state, 'ready');
         assert.equal(persisted.index.indexedAt, first.index.indexedAt);
         assert.deepEqual(persisted.summary, first.summary);
+        assert.deepEqual(ready(await restarted.read(filename, { ...range, project: project.id })).topSessions, first.topSessions);
         assert.equal(persisted.index.sourceChanged, false);
       } finally { await restarted.close(); }
       assert.equal((await stat(filename)).mtimeMs, before.mtimeMs);
@@ -115,16 +126,107 @@ test('explicit refresh is atomic, failures retain the old snapshot, and failed i
       assert.deepEqual(await readFile(published), bytes);
       assert.equal((await index.read(filename, range)).index.state, 'failed');
       assert.deepEqual((await readdir(cache)).sort(), [key + '.sqlite']);
-      const empty = new UsageIndex(path.join(directory, 'empty-cache'));
+      let now = 0;
+      const empty = new UsageIndex(path.join(directory, 'empty-cache'), () => now);
       try {
-        assert.equal((await empty.read(filename, range)).status, 'indexing');
+        assert.equal((await empty.status(filename)).state, 'indexing');
         const unavailable = await settled(empty, filename);
         assert.equal(unavailable.status, 'unavailable'); assert.equal(unavailable.index.state, 'failed');
         db.exec('CREATE TABLE session(id TEXT PRIMARY KEY, parent_id TEXT, time_created INTEGER)');
+        now += 60 * 60_000;
+        assert.match((await empty.status(filename)).message!, /Use Refresh to retry/);
         assert.equal((await empty.read(filename, range)).status, 'unavailable'); // No automatic retry after repair.
         assert.equal((await empty.read(filename, range, true)).status, 'indexing');
         assert.equal(ready(await settled(empty, filename)).index.state, 'ready');
       } finally { await empty.close(); }
+    } finally { await index.close(); }
+  });
+});
+
+test('status wakes one dirty-cache rebuild and enforces a completion cooldown while range GETs retain previous counts', async () => {
+  await fixture(async (filename, directory, db) => {
+    let now = 0;
+    const cache = path.join(directory, 'cache'), index = new UsageIndex(cache, () => now);
+    try {
+      const [status, usage] = await Promise.all([index.status(filename), index.read(filename, range)]);
+      assert.deepEqual(status, { state: 'indexing', indexedAt: null, sourceChanged: false });
+      assert.equal(usage.status, 'indexing');
+      const first = ready(await settled(index, filename));
+      const update = db.prepare('UPDATE message SET data=json_set(data, ?, ?)');
+      update.run('$.tokens.input', 50);
+      now = 5 * 60_000 - 1;
+      assert.deepEqual(await index.status(filename), { ...first.index, sourceChanged: true });
+
+      now++;
+      assert.equal((await index.read(filename, range)).index.state, 'ready');
+      const statuses = await Promise.all(Array.from({ length: 8 }, () => index.status(filename)));
+      for (const status of statuses) assert.deepEqual(status, { state: 'refreshing', indexedAt: first.index.indexedAt, sourceChanged: true });
+      const refreshing = ready(await index.read(filename, range));
+      assert.equal(refreshing.index.state, 'refreshing');
+      assert.deepEqual(refreshing.summary, first.summary);
+      const second = ready(await settled(index, filename));
+      assert.equal(second.summary.tokens.input, 50);
+      assert.deepEqual(await index.status(filename), second.index);
+
+      // A build can detect writes while it was reading, even if the current
+      // fingerprint still matches the published header's initial check.
+      const key = (await usageSourceState(filename)).identity;
+      const cached = new DatabaseSync(path.join(cache, key + '.sqlite'));
+      try { cached.exec("UPDATE inspector_usage_index SET data=json_set(data,'$.changedDuringBuild',json('true'))"); }
+      finally { cached.close(); }
+      now += 5 * 60_000 - 1;
+      assert.deepEqual(await index.status(filename), { ...second.index, sourceChanged: true });
+      now++;
+      assert.equal((await index.status(filename)).state, 'refreshing');
+      assert.equal((await settled(index, filename)).index.sourceChanged, false);
+    } finally { await index.close(); }
+  });
+});
+
+test('a failed automatic rebuild keeps the previous snapshot and notice, backs off, and can be manually retried', async () => {
+  await fixture(async (filename, directory, db) => {
+    let now = 0;
+    const cache = path.join(directory, 'cache'), index = new UsageIndex(cache, () => now);
+    try {
+      const first = ready(await settled(index, filename));
+      db.exec('ALTER TABLE session RENAME TO original_session');
+      now = 5 * 60_000;
+      assert.equal((await index.status(filename)).state, 'refreshing');
+      const failed = ready(await settled(index, filename));
+      assert.equal(failed.index.state, 'failed');
+      assert.match(failed.index.message!, /previous indexed snapshot/);
+      assert.deepEqual(failed.summary, first.summary);
+      assert.equal(failed.index.indexedAt, first.index.indexedAt);
+
+      now += 5 * 60_000 - 1;
+      assert.deepEqual(await index.status(filename), failed.index);
+      now++;
+      assert.deepEqual(await index.status(filename), { ...failed.index, state: 'refreshing' });
+      assert.deepEqual((await settled(index, filename)).index, failed.index);
+      db.exec('ALTER TABLE original_session RENAME TO session');
+      db.prepare('UPDATE message SET data=json_set(data, ?, ?)').run('$.tokens.input', 90);
+      assert.deepEqual(await index.status(filename), failed.index);
+      assert.equal((await index.read(filename, range, true)).index.state, 'refreshing');
+      const recovered = ready(await settled(index, filename));
+      assert.equal(recovered.summary.tokens.input, 90);
+      assert.equal(recovered.index.message, undefined);
+      now += 60 * 60_000;
+      assert.deepEqual(await index.status(filename), recovered.index);
+    } finally { await index.close(); }
+  });
+});
+
+test('status reads a valid header without querying accounting tables', async () => {
+  await fixture(async (filename, directory) => {
+    const cache = path.join(directory, 'cache'), index = new UsageIndex(cache);
+    try {
+      const first = ready(await settled(index, filename));
+      const key = (await usageSourceState(filename)).identity;
+      const cached = new DatabaseSync(path.join(cache, key + '.sqlite'));
+      try { cached.exec('DROP TABLE session'); }
+      finally { cached.close(); }
+      assert.deepEqual(await index.status(filename), first.index);
+      assert.equal((await index.read(filename, range)).status, 'unavailable');
     } finally { await index.close(); }
   });
 });
@@ -139,11 +241,13 @@ test('source replacement uses a new identity; temporary source failure retains o
       const missing = ready(await index.read(filename, range));
       assert.equal(missing.index.sourceChanged, null); assert.equal(missing.status, 'partial');
       assert.deepEqual(missing.summary, first.summary);
+      assert.deepEqual(await index.status(filename), missing.index);
       const replacement = seed(filename);
       replacement.prepare('UPDATE message SET data=json_set(data, ?, ?)').run('$.tokens.input', 99);
       replacement.close();
       assert.notEqual((await usageSourceState(filename)).identity, identity);
-      const initial = await index.read(filename, range);
+      const [nextStatus, initial] = await Promise.all([index.status(filename), index.read(filename, range)]);
+      assert.deepEqual(nextStatus, { state: 'indexing', indexedAt: null, sourceChanged: false });
       assert.equal(initial.status, 'indexing'); assert.equal('summary' in initial, false);
       assert.equal(ready(await settled(index, filename)).summary.tokens.input, 99);
       assert.equal((await readdir(cache)).filter(file => file.endsWith('.sqlite')).length, 2);
@@ -158,9 +262,8 @@ test('incompatible, wrong-source and corrupt cache metadata is rebuilt rather th
     try { ready(await settled(initial, filename)); } finally { await initial.close(); }
     const identity = (await usageSourceState(filename)).identity;
     const published = path.join(cache, identity + '.sqlite');
-    assert.equal(usageIndexVersion, 6);
     for (const invalidate of [
-      (metadata: any) => JSON.stringify({ ...metadata, version: 5 }),
+      (metadata: any) => JSON.stringify({ ...metadata, version: usageIndexVersion - 1 }),
       (metadata: any) => JSON.stringify({ ...metadata, version: metadata.version + 1 }),
       (metadata: any) => JSON.stringify({ ...metadata, identity: '0'.repeat(64) }),
       () => '{invalid',
@@ -213,6 +316,42 @@ test('delegation private projection allowlists metadata, hashes associations and
         assert.deepEqual(readUsageSnapshot(projected, range, 'fixed', true), readUsageSnapshot(db, range, 'fixed'));
       } finally { projected.close(); }
     } finally { await index.close(); }
+  });
+});
+
+test('indexed session labels seek only touched sessions and ancestors, once per request', async t => {
+  await fixture(async (_filename, _directory, db) => {
+    db.exec(`ALTER TABLE session ADD COLUMN title TEXT;
+      UPDATE session SET parent_id='ancestor';`);
+    const insertSession = db.prepare('INSERT INTO session VALUES(?,NULL,?,?)');
+    insertSession.run('ancestor', from - 2000, 'Ancestor');
+    for (let i = 0; i < 2000; i++) insertSession.run(`older-${i}`, from - 100_000, 'Unrelated historical label');
+    const insertMessage = db.prepare('INSERT INTO message VALUES(?,?,?,?,?)');
+    for (let i = 0; i < 30; i++) insertMessage.run(`m-${i}`, 'PRIVATE SESSION ID', from + 1, from + 1, JSON.stringify({ role: 'assistant', tokens }));
+    const index = new DatabaseSync(':memory:');
+    try {
+      projectUsageMetadata(db, index);
+      const prepare = index.prepare.bind(index), queries: string[] = [], seen: string[] = [];
+      t.mock.method(index, 'prepare', (sql: string) => {
+        const statement = prepare(sql);
+        if (sql.includes('inspector_usage_session_label')) {
+          queries.push(sql);
+          const get = statement.get.bind(statement);
+          t.mock.method(statement, 'get', (key: string) => { seen.push(key); return get(key); });
+        }
+        return statement;
+      });
+      const usage = readUsageSnapshot(index, range, 'fixed', true);
+      assert.ok(usage.status !== 'unavailable');
+      assert.equal(usage.topSessions[0].title, 'Ancestor');
+      assert.equal(usage.topSessions[0].steps, 31);
+      assert.equal(queries.length, 1);
+      assert.equal(seen.length, 2);
+      assert.equal(new Set(seen).size, 2);
+      const plan = prepare(`EXPLAIN QUERY PLAN ${queries[0]}`).all(seen[0]).map(row => String(row.detail));
+      assert.equal(plan.filter(detail => /SEARCH .*key=\?/.test(detail)).length, 2);
+      assert.ok(!plan.some(detail => /\bSCAN\b/.test(detail)));
+    } finally { index.close(); }
   });
 });
 
@@ -398,6 +537,7 @@ test('HTTP remains responsive during indexing and close waits for child/temp-fil
       }); req.on('error', reject); req.end();
     });
     try {
+      assert.deepEqual(await get('/api/usage/status'), { state: 'indexing', indexedAt: null, sourceChanged: false });
       const initial = await get(`/api/usage?from=${range.from}&to=${range.to}&timezone=UTC`);
       assert.equal(initial.status, 'indexing');
       const snapshot = await get('/api/snapshot');
@@ -405,5 +545,46 @@ test('HTTP remains responsive during indexing and close waits for child/temp-fil
     } finally { await new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve())); }
     const files = await readdir(cache).catch(() => []);
     assert.ok(files.every(file => file.endsWith('.sqlite')), files.join(','));
+  });
+});
+
+test('new index endpoint observes without work, explicitly rebuilds, and validates raw query selection', async () => {
+  await fixture(async (filename, directory) => {
+    const cache = path.join(directory, 'cache');
+    const app = createApp({ root: path.resolve('examples/demo'), usageDatabase: filename, usageCacheDirectory: cache });
+    const server = app.listen(0, '127.0.0.1');
+    await new Promise<void>(resolve => server.once('listening', resolve));
+    const get = (url: string) => new Promise<{ status: number; body: any }>((resolve, reject) => {
+      const req = request({ hostname: '127.0.0.1', port: (server.address() as { port: number }).port, path: url, headers: { host: '127.0.0.1:4317' } }, res => {
+        let body = ''; res.on('data', chunk => body += chunk); res.on('end', () => resolve({ status: res.statusCode!, body: JSON.parse(body) }));
+      }); req.on('error', reject); req.end();
+    });
+    const observe = '/api/usage/index?mode=observe', rebuild = '/api/usage/index?mode=rebuild';
+    const waitReady = async () => {
+      for (let i = 0; i < 500; i++) {
+        const { body } = await get(observe);
+        if (body.state === 'ready' && body.indexedAt) return body;
+        assert.ok(body.state === 'indexing' || body.state === 'refreshing', JSON.stringify(body));
+        await delay(10);
+      }
+      throw new Error('Index did not settle');
+    };
+    try {
+      const observed = await get(observe);
+      assert.equal(observed.status, 200);
+      assert.deepEqual(observed.body, { state: 'ready', indexedAt: null, sourceChanged: true });
+      assert.deepEqual(await readdir(cache).catch(() => []), []);
+      const invalid = await get('/api/usage/index?mode=observe&mode=rebuild');
+      assert.equal(invalid.status, 400);
+      assert.equal((await get('/api/usage/index?unexpected=1')).status, 400);
+      assert.equal((await get('/api/usage/index?mode=unknown')).status, 400);
+      assert.equal((await get('/api/usage/index')).status, 400);
+      assert.equal((await get(rebuild)).body.state, 'indexing');
+      assert.equal((await get('/api/usage/status')).body.state, 'indexing');
+      const first = await waitReady();
+      assert.equal(first.sourceChanged, false);
+      assert.deepEqual((await get(rebuild)).body, { ...first, state: 'refreshing' });
+      assert.notEqual((await waitReady()).indexedAt, first.indexedAt);
+    } finally { await new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve())); }
   });
 });

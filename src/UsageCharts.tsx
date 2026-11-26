@@ -1,137 +1,189 @@
-import { useEffect, useRef, useState, type CSSProperties } from 'react';
-import type { UsageCounts, UsageTokens } from './usage-types';
+import { createMemo, createSignal, Index, mergeProps, Show } from 'solid-js';
+import { ChartInspection, ChartLegend, chartNumber as number, chartTargetKey, useChartInspection, usePlotWidth, type ChartDatum, type InspectionState } from './ChartInspection';
+import { usageBucketAxis, usageBucketFrequency, usageChartBuckets } from './usage-chart-dates';
+import { localDateInput } from './usage-period';
+import type { UsageCounts, UsageGranularity, UsageTokens } from './usage-types';
+
+export { ChartInspection, useChartInspection, usePlotWidth } from './ChartInspection';
+
+export type UsageMeasure = 'tokens' | 'steps';
 
 const parts = [
-  ['Input', 'input', '#80b9c2'], ['Output', 'output', '#d49a65'],
-  ['Reasoning', 'reasoning', '#ad91c7'], ['Cache read', 'cacheRead', '#8eae78'],
-  ['Cache write', 'cacheWrite', '#d17f84'],
+  { label: 'Input', key: 'input', color: '#80b9c2' },
+  { label: 'Output', key: 'output', color: '#d49a65' },
+  { label: 'Reasoning', key: 'reasoning', color: '#ad91c7' },
+  { label: 'Cache read', key: 'cacheRead', color: '#8eae78' },
+  { label: 'Cache write', key: 'cacheWrite', color: '#d17f84' },
 ] as const;
-const number = (value: number) => value.toLocaleString('en-US');
 const compactNumber = new Intl.NumberFormat('en-US', { notation: 'compact', maximumFractionDigits: 1 });
+const shortDate = new Intl.DateTimeFormat('en-US', { month: 'short', day: 'numeric', timeZone: 'UTC' });
+const fullDate = new Intl.DateTimeFormat('en-US', { month: 'short', day: 'numeric', year: 'numeric', timeZone: 'UTC' });
 const rankingLimit = 8;
+const tokenEntries = (tokens?: UsageTokens, items: readonly { label: string; key: typeof parts[number]['key']; color: string }[] = parts) =>
+  items.map(({ label, key, color }) => ({ label, color, value: tokens?.[key] ?? 0 }));
+const stepEntries = (value: number) => [{ label: 'Assistant steps', color: parts[0].color, value }];
 
-function Legend() {
-  return <ul className="usage-chart-legend">{parts.map(([label, key, color]) =>
-    <li key={key}><span style={{ backgroundColor: color }} aria-hidden="true"/>{label}</li>)}</ul>;
+function BreakdownBar(props: { datum: ChartDatum; max: number; state: InspectionState }) {
+  return <div class="usage-chart-bar" aria-hidden="true">
+    <Index each={props.datum.entries}>{(entry, i) => <Show when={entry().value > 0}>
+      <span data-chart-key={i} class="usage-token-segment" classList={{ 'is-hovered': props.state.isSegment(props.datum.id, String(i)) }}
+        style={{ 'background-color': entry().color, '--token-size': `${entry().value / props.max * 100}%` }}/>
+    </Show>}</Index>
+  </div>;
 }
 
-type Breakdown = Array<{ label: string; color: string; value: number }>;
-type Hover = { id: string | number; index: number; heading: string; entries: Breakdown; total: number; left: number; top: number; width: number; above: boolean };
-function useBreakdown(identity: unknown[]) {
-  const root = useRef<HTMLDivElement>(null);
-  const [hover, setHover] = useState<Hover | null>(null);
-  useEffect(() => { setHover(null); }, [identity]);
-  const active = hover !== null;
-  useEffect(() => {
-    if (!active) return;
-    const escape = (event: KeyboardEvent) => { if (event.key === 'Escape') setHover(null); };
-    const dismiss = () => setHover(null);
-    window.addEventListener('keydown', escape);
-    window.addEventListener('scroll', dismiss, true);
-    window.addEventListener('resize', dismiss);
-    return () => {
-      window.removeEventListener('keydown', escape);
-      window.removeEventListener('scroll', dismiss, true);
-      window.removeEventListener('resize', dismiss);
-    };
-  }, [active]);
-  const show = (bar: HTMLElement | null, id: Hover['id'], index: number, heading: string, entries: Breakdown, total: number) => {
-    const box = root.current?.getBoundingClientRect();
-    if (!box || !bar) return;
-    const mark = bar.getBoundingClientRect();
-    const width = Math.min(320, box.width - 2);
-    const center = mark.left + mark.width / 2 - box.left;
-    const left = Math.max(0, Math.min(center - width / 2, box.width - width - 2));
-    const above = mark.top > 230 || window.innerHeight - mark.bottom < mark.top;
-    const top = (above ? mark.top - 5 : mark.bottom + 5) - box.top;
-    setHover(current => current?.id === id
-      ? current.index === index ? current : { ...current, index }
-      : { id, index, heading, entries, total, left, top, width, above });
+function inspectDatum(id: () => string, state: InspectionState) {
+  return {
+    get 'data-chart-bucket'() { return id(); },
+    get 'data-active'() { return state.isActive(id()); },
+    onPointerMove: (event: PointerEvent) => { if (event.pointerType === 'mouse') state.preview(id(), chartTargetKey(event.target)); },
+    onClick: (event: MouseEvent) => state.select(id(), chartTargetKey(event.target)),
   };
-  return { root, hover, dismiss: () => setHover(null), show };
 }
 
-function BreakdownTooltip({ hover }: { hover: Hover }) {
-  return <div className={`usage-chart-tooltip model-timeline-tooltip${hover.above ? ' above-mark' : ''}`} style={{ width: hover.width, left: hover.left, top: hover.top }} role="tooltip">
-    <strong>{hover.heading}</strong><ul>{hover.entries.map(({ label, color, value }, index) => <li key={index} className={hover.index === index ? 'is-hovered' : ''}><span style={{ backgroundColor: color }}/><span>{label}</span><b>{number(value)}</b></li>)}</ul>
-    <footer>Total <b>{number(hover.total)}</b></footer>
-  </div>;
+function activityScale(peak: number) {
+  // Aim for at most three intervals, using rounded whole-count steps.
+  const target = Math.max(1, peak / 3);
+  const power = 10 ** Math.floor(Math.log10(target));
+  const multiple = [1, 2, 2.5, 5, 10].find(n => n * power >= target) ?? 10;
+  const step = Math.ceil(multiple * power);
+  const intervals = Math.max(1, Math.ceil(peak / step));
+  return { ceiling: intervals * step, ticks: Array.from({ length: intervals + 1 }, (_, i) => i * step) };
 }
 
-const tokenEntries = (tokens: UsageTokens) => parts.map(([label, key, color]) => ({ label, color, value: tokens[key] }));
-
-function BreakdownBar({ entries, total, max, id, heading, state }: {
-  entries: Breakdown; total: number; max: number; id: Hover['id']; heading: string; state: ReturnType<typeof useBreakdown>;
+export function OverviewChart(input: {
+  activity: Array<UsageCounts & { date: string }>; from: number; to: number; metric: UsageMeasure; granularity?: UsageGranularity;
 }) {
-  const index = state.hover?.id === id ? state.hover.index : -1;
-  return <div className="usage-chart-bar" role="img" aria-label={entries.map(({ label, value }) => `${label} ${number(value)}`).join(', ') + `; total ${number(total)}`}
-    onPointerLeave={state.dismiss}>
-    {entries.map(({ color, value }, i) => value > 0
-      ? <span key={i} className={`usage-token-segment${i === index ? ' is-hovered' : ''}`}
-        onPointerEnter={event => state.show(event.currentTarget.parentElement, id, i, heading, entries, total)}
-        onClick={event => state.show(event.currentTarget.parentElement, id, i, heading, entries, total)}
-        style={{ backgroundColor: color, '--token-size': `${value / max * 100}%` } as CSSProperties}/>
-      : null)}
-  </div>;
-}
-
-export function OverviewChart({ activity, from, to }: { activity: Array<UsageCounts & { date: string }>; from: number; to: number }) {
-  const dates: string[] = [];
-  const cursor = new Date(from);
-  const end = new Date(to);
-  const today = new Date();
-  const observedThrough = new Date(today.getFullYear(), today.getMonth(), today.getDate() + 1);
-  while (cursor < end && cursor < observedThrough && dates.length < 32) {
-    dates.push(`${cursor.getFullYear()}-${String(cursor.getMonth() + 1).padStart(2, '0')}-${String(cursor.getDate()).padStart(2, '0')}`);
-    cursor.setDate(cursor.getDate() + 1);
-  }
-  const byDate = new Map(activity.map(day => [day.date, day]));
-  const max = Math.max(1, ...activity.map(day => day.tokens.total));
-  const state = useBreakdown(activity);
-  if (!activity.length) return <p className="secondary">No recorded activity in this period.</p>;
-  return <div className="usage-chart-card usage-token-chart" ref={state.root}>
-    <Legend/><div className="usage-daily-scroll" role="region" aria-label="Daily recorded token composition" tabIndex={0}>
-      <div className="usage-daily-chart" role="list">
-      {dates.map(date => {
-        const day = byDate.get(date);
-        const tokens = day?.tokens || { input: 0, output: 0, reasoning: 0, cacheRead: 0, cacheWrite: 0, total: 0 };
-        return <div className="usage-daily-column" role="listitem" key={date} aria-label={`${date}: ${number(tokens.total)} total tokens`}>
-          <span className="usage-daily-value" title={`${number(tokens.total)} recorded tokens`}>{compactNumber.format(tokens.total)}</span>
-          <BreakdownBar entries={tokenEntries(tokens)} total={tokens.total} max={max} id={date} heading={date} state={state}/>
-          <time dateTime={date}>{date.slice(5)}</time>
-        </div>;
-      })}
+  const props = mergeProps({ granularity: 'day' } as const, input);
+  const [hiddenParts, setHiddenParts] = createSignal<readonly typeof parts[number]['key'][]>([]);
+  const togglePart = (key: typeof parts[number]['key']) => setHiddenParts(current =>
+    current.includes(key) ? current.filter(hidden => hidden !== key) : [...current, key]);
+  const displayedParts = createMemo(() => parts.filter(part => !hiddenParts().includes(part.key)));
+  const measure = () => props.metric === 'steps' ? 'assistant steps' : hiddenParts().length ? 'visible tokens' : 'tokens';
+  // The API still returns daily overview counts for hourly ranges.
+  const frequency = createMemo(() => props.granularity === 'hour' ? 'day' : props.granularity);
+  const buckets = createMemo(() => {
+    // A refresh can extend the observed portion of a range ending in the future.
+    void props.activity;
+    const now = Date.now();
+    const today = frequency() === 'day' && props.from <= now && now < props.to ? localDateInput(new Date(now)) : undefined;
+    const { buckets, labelGap } = usageChartBuckets(props.from, props.to, frequency(), now);
+    return buckets.map(bucket => {
+      if (frequency() === 'month') return { ...bucket, labelGap };
+      const date = new Date(bucket.id);
+      if (bucket.id === today) return { ...bucket, heading: `Today so far · ${fullDate.format(date)}`, label: 'Today so far', labelGap: 76 };
+      return {
+        ...bucket,
+        heading: frequency() === 'day' ? fullDate.format(date) : bucket.heading,
+        label: shortDate.format(date),
+        labelGap: 52,
+      };
+    });
+  });
+  const data = createMemo(() => {
+    const byDate = new Map(props.activity.map(day => [day.date, day]));
+    return buckets().map(({ id, heading, label, labelGap }) => {
+      const day = byDate.get(id);
+      const entries = props.metric === 'steps' ? stepEntries(day?.steps ?? 0) : tokenEntries(day?.tokens, displayedParts());
+      return { id, heading, label, labelGap, entries, total: entries.reduce((total, entry) => total + entry.value, 0) };
+    });
+  });
+  const scale = createMemo(() => activityScale(data().reduce((peak, day) => Math.max(peak, day.total), 0)));
+  const state = useChartInspection(() => [props.activity, props.from, props.to, frequency(), props.metric, hiddenParts()]);
+  const plot = usePlotWidth();
+  const labelOffsets = createMemo(() => {
+    const offsets = new Map<number, number>();
+    const width = plot.width(), days = data(), bin = width / days.length;
+    // Keep the latest date (or Today so far) visible, then fit older labels.
+    let next = width;
+    for (let i = days.length - 1; i >= 0; i--) {
+      const half = days[i].labelGap / 2;
+      const center = (i + .5) * bin;
+      const x = Math.max(half, Math.min(center, width - half));
+      if (x + half > next) continue;
+      offsets.set(i, x - center);
+      next = x - half;
+    }
+    return offsets;
+  });
+  return <Show when={props.activity.length && data().length} fallback={<p class="secondary">No recorded activity in this period.</p>}>
+    <div class="usage-chart-card usage-overview-chart" ref={state.ref}>
+      <Show when={props.metric === 'tokens'}>
+        <ul class="usage-chart-legend usage-activity-legend" aria-label="Token categories shown in Activity">
+          <Index each={parts}>{part => <li>
+            <button type="button" aria-pressed={!hiddenParts().includes(part().key)} onClick={() => togglePart(part().key)}>
+              <span style={{ '--token-color': part().color }} aria-hidden="true"/>
+              {part().label}
+            </button>
+          </li>}</Index>
+        </ul>
+      </Show>
+      <div class="usage-activity-plot" ref={plot.ref} aria-label={`${usageBucketFrequency[frequency()]} recorded ${measure()}, earliest at left`}
+        {...state.keyboard(data)} onPointerLeave={state.leave}>
+        <div class="usage-activity-grid" aria-hidden="true">
+          <Index each={scale().ticks}>{tick => <div class="usage-activity-tick" classList={{ 'is-baseline': tick() === 0 }}
+            style={{ bottom: `${tick() / scale().ceiling * 100}%` }}>
+            <span>{compactNumber.format(tick())}</span>
+          </div>}</Index>
+        </div>
+        <Show when={props.metric === 'tokens' && !displayedParts().length}>
+          <p class="usage-activity-empty" role="status">All categories hidden. Select a category to show it.</p>
+        </Show>
+        <Index each={data()}>{(day, i) => {
+          return <div class="usage-activity-column" {...inspectDatum(() => day().id, state)}
+            style={{ '--activity-mark-height': `${day().total / scale().ceiling * 100}%` }}>
+            <BreakdownBar datum={day()} max={day().total || 1} state={state}/>
+            <Show when={labelOffsets().has(i)}><time dateTime={day().id} style={{ transform: `translateX(${labelOffsets().get(i)}px)` }}>{day().label}</time></Show>
+          </div>;
+        }}</Index>
       </div>
-    </div>{state.hover && <BreakdownTooltip hover={state.hover}/>}
+      <Show when={frequency() !== 'day'}><p class="usage-overview-axis">{usageBucketAxis[frequency()]}</p></Show>
+      <ChartInspection data={data()} state={state} totalLabel={`Total ${measure()}`}/>
+    </div>
+  </Show>;
+}
+
+export function RankedModelChart(props: { label: string; measure: UsageMeasure; rows: Array<{ label: string; tokens: UsageTokens; steps: number }> }) {
+  const state = useChartInspection(() => [props.rows, props.measure]);
+  const data = createMemo(() => props.rows.map((row, index) => ({
+    id: String(index), heading: row.label,
+    entries: props.measure === 'tokens' ? tokenEntries(row.tokens) : stepEntries(row.steps),
+    total: props.measure === 'tokens' ? row.tokens.total : row.steps,
+  })));
+  const max = createMemo(() => data().reduce((peak, row) => Math.max(peak, row.total), 1));
+  return <div class="usage-chart-card" ref={state.ref}>
+    <Show when={props.measure === 'tokens'}><ChartLegend items={parts}/></Show>
+    <RankedBars label={props.label} data={data()} max={max()} state={state}/>
   </div>;
 }
 
-export function RankedTokenChart({ rows }: { rows: Array<{ label: string; tokens: UsageTokens }> }) {
-  const max = Math.max(1, ...rows.map(row => row.tokens.total));
-  const state = useBreakdown(rows);
-  return <div className="usage-chart-card usage-token-chart" ref={state.root}><Legend/><ol className="usage-ranked-chart">
-    {rows.map((row, index) => <li key={`${row.label}-${index}`}><span className="usage-chart-label">{row.label}</span><BreakdownBar entries={tokenEntries(row.tokens)} total={row.tokens.total} max={max} id={index} heading={row.label} state={state}/><strong>{number(row.tokens.total)}</strong></li>)}
-  </ol>{state.hover && <BreakdownTooltip hover={state.hover}/>}</div>;
+function RankedBars(props: { label?: string; data: ChartDatum[]; max: number; state: InspectionState }) {
+  return <>
+    <ol class="usage-ranked-chart" aria-label={props.label} onPointerLeave={props.state.leave}>
+      <Index each={props.data}>{datum => <li {...inspectDatum(() => datum().id, props.state)}>
+        <span class="usage-chart-label">{datum().heading}</span>
+        <BreakdownBar datum={datum()} max={props.max} state={props.state}/><strong>{number(datum().total)}</strong>
+      </li>}</Index>
+    </ol>
+    <ChartInspection label="Inspect entry" data={props.data} state={props.state}/>
+  </>;
 }
 
-export function RankedCountChart({ label, rows, successLabel, failureLabel }: {
+export function RankedCountChart(props: {
   label: string; rows: Array<{ name: string; success: number; failure?: number }>; successLabel: string; failureLabel?: string;
 }) {
-  const max = Math.max(1, ...rows.map(row => row.success + (row.failure || 0)));
-  const colors = ['#80b9c2', '#d17f84'];
-  const state = useBreakdown(rows);
-  return <div className="usage-chart-card usage-token-chart" ref={state.root}><ul className="usage-chart-legend">
-    <li><span style={{ backgroundColor: colors[0] }} aria-hidden="true"/>{successLabel}</li>
-    {failureLabel && <li><span style={{ backgroundColor: colors[1] }} aria-hidden="true"/>{failureLabel}</li>}
-  </ul><ol className="usage-ranked-chart" aria-label={label}>
-    {rows.slice(0, rankingLimit).map((row, index) => {
-      const entries = [{ label: successLabel, color: colors[0], value: row.success }];
-      if (failureLabel) entries.push({ label: failureLabel, color: colors[1], value: row.failure ?? 0 });
-      const total = row.success + (row.failure ?? 0);
-      return <li key={`${row.name}-${index}`}><span className="usage-chart-label">{row.name}</span>
-        <BreakdownBar entries={entries} total={total} max={max} id={index} heading={row.name} state={state}/><strong>{number(total)}</strong>
-      </li>;
-    })}
-  </ol>{state.hover && <BreakdownTooltip hover={state.hover}/>}
-    {rows.length > rankingLimit && <p className="usage-chart-note secondary">Top {rankingLimit} of {rows.length}. See the table for all entries.</p>}</div>;
+  const max = createMemo(() => Math.max(1, ...props.rows.map(row => row.success + (row.failure || 0))));
+  const legend = createMemo(() => [
+    { label: props.successLabel, color: '#80b9c2' },
+    ...(props.failureLabel ? [{ label: props.failureLabel, color: '#d17f84' }] : []),
+  ]);
+  const state = useChartInspection(() => props.rows);
+  const data = createMemo(() => props.rows.slice(0, rankingLimit).map((row, index) => ({
+    id: String(index), heading: row.name, entries: legend().map((item, i) => ({ ...item, value: i === 0 ? row.success : row.failure ?? 0 })),
+    total: row.success + (row.failure ?? 0),
+  })));
+  return <div class="usage-chart-card" ref={state.ref}><ChartLegend items={legend()}/>
+    <RankedBars label={props.label} data={data()} max={max()} state={state}/>
+    <Show when={props.rows.length > rankingLimit}><p class="usage-chart-note secondary">Top {rankingLimit} of {props.rows.length}. See the table for all entries.</p></Show>
+  </div>;
 }
